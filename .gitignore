@@ -1,0 +1,5 @@
+config.json
+config.json.tmp
+today2api
+dist/
+*.test

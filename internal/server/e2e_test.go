@@ -1,0 +1,398 @@
+package server
+
+import (
+	"bufio"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/misakano7545/today2api-panel/internal/config"
+)
+
+// mockToday 是上游的替身：实现 token 换票、发消息、轮询回复三段。
+type mockToday struct {
+	mu     sync.Mutex
+	polls  int
+	texts  []string // assistant 正文的逐次快照，最后一次视为终稿
+	prompt string
+	sent   []map[string]any
+}
+
+func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
+	t.Helper()
+	m := &mockToday{texts: []string{"", "你好", "你好世界"}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/token":
+			if strings.Contains(r.Header.Get("Cookie"), "bad") {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"invalid session"}`))
+				return
+			}
+			if !strings.Contains(r.Header.Get("Origin"), "://") {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			_, _ = w.Write([]byte(`{"token":"jwt-test","expiresIn":600}`))
+		case r.URL.Path == "/v1/users/me":
+			_, _ = w.Write([]byte(`{"id":"u1","email":"u1@example.com","plan":"pro"}`))
+		case r.URL.Path == "/v1/pricing/status":
+			_, _ = w.Write([]byte(`{"data":{"status":{"plan":{"id":"pro"},"modelOptions":{"selectedOptionId":"model.deepseek-v4.1-flash","availableOptions":[{"optionId":"model.deepseek-v4.1-flash"},{"optionId":"model.glm-5.3"}]}}}}`))
+		case r.URL.Path == "/v1/pricing/model-option" && r.Method == http.MethodPut:
+			if r.Header.Get("Authorization") != "Bearer jwt-test" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/v1/messages":
+			if r.Header.Get("Authorization") != "Bearer jwt-test" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			m.mu.Lock()
+			m.sent = append(m.sent, body)
+			if s, ok := body["content"].(string); ok {
+				m.prompt = s
+			}
+			m.mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"threadId":"thr-1","messageId":"msg-1"}`))
+		case r.URL.Path == "/v1/conversations/messages":
+			m.mu.Lock()
+			idx := m.polls
+			if idx >= len(m.texts) {
+				idx = len(m.texts) - 1
+			}
+			m.polls++
+			text := m.texts[idx]
+			final := idx == len(m.texts)-1
+			m.mu.Unlock()
+			state := "running"
+			if final {
+				state = "completed"
+			}
+			payload := map[string]any{
+				"data": map[string]any{"items": []any{map[string]any{
+					"threadId": "thr-1", "role": "assistant", "state": state, "isFinal": final,
+					"body": map[string]any{"parts": []any{map[string]any{
+						"messageType": "text", "content": map[string]any{"text": text},
+					}}},
+				}}},
+			}
+			_ = json.NewEncoder(w).Encode(payload)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, m
+}
+
+// newTestServer 组装一个指向 mock 上游的网关。
+func newTestServer(t *testing.T, upstream string, mutate func(*config.Config)) *Server {
+	t.Helper()
+	cfg := config.Defaults()
+	cfg.Upstream.CN = config.Endpoints{App: upstream, API: upstream, Auth: upstream}
+	cfg.Upstream.Global = cfg.Upstream.CN
+	cfg.PollIntervalMs = 40
+	cfg.ReplyTimeoutSec = 10
+	cfg.Accounts = []config.Account{{ID: "acc_1", Label: "a1", Realm: "cn", Cookie: "__Secure-better-auth.session_token=ok", Enabled: true}}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw, _ := json.Marshal(cfg)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(store, "test")
+}
+
+// req 构造一个来自本机的请求（httptest 默认 RemoteAddr 非回环，面板会拒绝）。
+func req(method, path string, body any) *http.Request {
+	var rd io.Reader
+	switch b := body.(type) {
+	case nil:
+	case string:
+		rd = strings.NewReader(b)
+	case io.Reader:
+		rd = b
+	}
+	r := httptest.NewRequest(method, path, rd)
+	r.RemoteAddr = "127.0.0.1:54321"
+	return r
+}
+
+func makeKey(t *testing.T, s *Server) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req(http.MethodPost, "/api/panel/keys", strings.NewReader(`{"name":"t"}`)))
+	if rec.Code != 200 {
+		t.Fatalf("create key: %d %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Key string `json:"key"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	return out.Key
+}
+
+func TestChatCompletionsNonStream(t *testing.T) {
+	up, mock := newMockToday(t)
+	s := newTestServer(t, up.URL, nil)
+	key := makeKey(t, s)
+
+	body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"你好"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+key)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Choices[0].Message.Content; got != "你好世界" {
+		t.Fatalf("content = %q", got)
+	}
+	if !strings.Contains(mock.prompt, "你是助手") || !strings.Contains(mock.prompt, "你好") {
+		t.Fatalf("prompt = %q", mock.prompt)
+	}
+	if channel, _ := mock.sent[0]["channel"].(string); channel != "main" {
+		t.Fatalf("channel = %q（缺了它上游查不到 thread）", channel)
+	}
+}
+
+func TestChatCompletionsStream(t *testing.T) {
+	up, _ := newMockToday(t)
+	s := newTestServer(t, up.URL, nil)
+	key := makeKey(t, s)
+
+	body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+key)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "event-stream") {
+		t.Fatalf("content-type = %q", ct)
+	}
+	text, done := sseText(t, rec.Body)
+	if text != "你好世界" {
+		t.Fatalf("stream text = %q", text)
+	}
+	if !done {
+		t.Fatal("missing [DONE]")
+	}
+}
+
+// sseText 拼接 OpenAI chunk 里的 delta.content。
+func sseText(t *testing.T, r io.Reader) (string, bool) {
+	t.Helper()
+	var buf strings.Builder
+	done := false
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			done = true
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(payload), &chunk) != nil {
+			continue
+		}
+		for _, c := range chunk.Choices {
+			buf.WriteString(c.Delta.Content)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String(), done
+}
+
+func TestAnthropicStream(t *testing.T) {
+	up, _ := newMockToday(t)
+	s := newTestServer(t, up.URL, nil)
+	key := makeKey(t, s)
+
+	body := `{"model":"deepseek-v4.1-flash","system":"你是助手","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"你好"}]}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("x-api-key", key)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var text strings.Builder
+	var sawStart, sawStop bool
+	sc := bufio.NewScanner(rec.Body)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev struct {
+			Type  string `json:"type"`
+			Delta struct {
+				Text string `json:"text"`
+			} `json:"delta"`
+		}
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev) != nil {
+			continue
+		}
+		switch ev.Type {
+		case "message_start":
+			sawStart = true
+		case "content_block_delta":
+			text.WriteString(ev.Delta.Text)
+		case "message_stop":
+			sawStop = true
+		}
+	}
+	if !sawStart || !sawStop {
+		t.Fatalf("stream events incomplete: start=%v stop=%v", sawStart, sawStop)
+	}
+	if text.String() != "你好世界" {
+		t.Fatalf("text = %q", text.String())
+	}
+}
+
+func TestResponsesStream(t *testing.T) {
+	up, _ := newMockToday(t)
+	s := newTestServer(t, up.URL, nil)
+	key := makeKey(t, s)
+
+	body := `{"model":"deepseek-v4.1-flash","instructions":"简洁回答","input":[{"role":"user","content":[{"type":"input_text","text":"你好"}]}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+key)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var text strings.Builder
+	var completed bool
+	sc := bufio.NewScanner(rec.Body)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev struct {
+			Type  string `json:"type"`
+			Delta string `json:"delta"`
+		}
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev) != nil {
+			continue
+		}
+		if ev.Type == "response.output_text.delta" {
+			text.WriteString(ev.Delta)
+		}
+		if ev.Type == "response.completed" {
+			completed = true
+		}
+	}
+	if !completed {
+		t.Fatal("missing response.completed")
+	}
+	if text.String() != "你好世界" {
+		t.Fatalf("text = %q", text.String())
+	}
+}
+
+func TestResponsesNonStream(t *testing.T) {
+	up, _ := newMockToday(t)
+	s := newTestServer(t, up.URL, nil)
+	key := makeKey(t, s)
+	req := req(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"deepseek-v4.1-flash","input":"你好"}`))
+	req.Header.Set("Authorization", "Bearer "+key)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"output_text"`) || !strings.Contains(rec.Body.String(), "你好世界") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestKeyRequired(t *testing.T) {
+	up, _ := newMockToday(t)
+	s := newTestServer(t, up.URL, nil)
+	makeKey(t, s)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req(http.MethodGet, "/v1/models", nil))
+	if rec.Code != 401 {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestFailoverToSecondAccount(t *testing.T) {
+	up, _ := newMockToday(t)
+	s := newTestServer(t, up.URL, func(c *config.Config) {
+		c.Accounts = []config.Account{
+			{ID: "acc_bad", Label: "bad", Realm: "cn", Cookie: "__Secure-better-auth.session_token=bad", Enabled: true},
+			{ID: "acc_ok", Label: "ok", Realm: "cn", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
+		}
+	})
+	key := makeKey(t, s)
+	for i := 0; i < 3; i++ { // 轮转起点不同，两次都要能落到可用账号
+		req := req(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"你好"}]}`))
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), "你好世界") {
+			t.Fatalf("attempt %d: %d %s", i, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestPanelHidesCookie(t *testing.T) {
+	up, _ := newMockToday(t)
+	s := newTestServer(t, up.URL, nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req(http.MethodGet, "/api/panel/state", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "better-auth.session_token") {
+		t.Fatal("panel state leaked cookie")
+	}
+}

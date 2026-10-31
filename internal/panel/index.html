@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Today2API · 控制台</title>
+<script src="theme.js"></script>
+<style>
+:root {
+  --bg:#0b0d12; --surface:#12151c; --surface-2:#171b24; --raise:#1d222d;
+  --line:#242a36; --line-soft:#1c212b;
+  --ink:#e7eaf1; --ink-2:#a4acbd; --ink-3:#6b7385;
+  --accent:#5b7cfa; --accent-ink:#fff; --accent-soft:rgba(91,124,250,.14);
+  --ok:#3ddc97; --ok-soft:rgba(61,220,151,.12);
+  --warn:#f5b544; --warn-soft:rgba(245,181,68,.12);
+  --bad:#f0655f; --bad-soft:rgba(240,101,95,.12);
+  --mono:ui-monospace,"Cascadia Mono","SF Mono",Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6);
+}
+[data-theme="light"] {
+  --bg:#f4f5f8; --surface:#fff; --surface-2:#f8f9fb; --raise:#fff;
+  --line:#e2e5ec; --line-soft:#eceef3;
+  --ink:#14171f; --ink-2:#545c6e; --ink-3:#8b93a5;
+  --accent:#3d5fe0; --accent-soft:rgba(61,95,224,.09);
+  --ok:#0f9d63; --ok-soft:rgba(15,157,99,.1);
+  --warn:#b47611; --warn-soft:rgba(180,118,17,.11);
+  --bad:#cf3b34; --bad-soft:rgba(207,59,52,.09);
+  --shadow:0 1px 2px rgba(16,20,32,.06),0 8px 24px -14px rgba(16,20,32,.16);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+[hidden]{display:none!important}
+body{background:var(--bg);color:var(--ink);font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased}
+::selection{background:var(--accent-soft)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+h1,h2,h3{font-weight:620;letter-spacing:-.01em}
+button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--raise);color:var(--ink);border-radius:8px;padding:7px 12px}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+button.ghost{background:transparent}
+button.danger{color:var(--bad);border-color:var(--line)}
+button.danger:hover{border-color:var(--bad)}
+button:disabled{opacity:.5;cursor:not-allowed}
+input,select,textarea{font:inherit;width:100%;background:var(--surface-2);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+textarea{font-family:var(--mono);font-size:12.5px;resize:vertical}
+label.field{display:block;margin-bottom:12px}
+label.field span{display:block;font-size:12.5px;color:var(--ink-2);margin-bottom:5px}
+.hint{color:var(--ink-3);font-size:12px;margin-top:4px}
+
+.shell{display:grid;grid-template-columns:206px 1fr;min-height:100vh}
+.nav{background:var(--surface);border-right:1px solid var(--line);display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+.brand{padding:20px 18px 16px;border-bottom:1px solid var(--line-soft)}
+.brand .name{font-weight:650;font-size:15px}
+.brand .sub{color:var(--ink-3);font-size:11.5px;margin-top:3px}
+.nav nav{padding:10px;display:flex;flex-direction:column;gap:2px}
+.nav a{display:flex;align-items:center;gap:9px;padding:9px 11px;border-radius:8px;color:var(--ink-2);text-decoration:none;font-size:13.5px}
+.nav a:hover{background:var(--surface-2);color:var(--ink)}
+.nav a.active{background:var(--accent-soft);color:var(--ink);font-weight:560}
+.nav .foot{margin-top:auto;padding:14px 18px;border-top:1px solid var(--line-soft);color:var(--ink-3);font-size:11.5px;display:flex;gap:8px;justify-content:space-between;align-items:center}
+
+main{padding:22px 26px 60px;max-width:1180px}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;gap:12px}
+.topbar h1{font-size:19px}
+.topbar .meta{color:var(--ink-3);font-size:12px;font-family:var(--mono)}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow)}
+.card .k{color:var(--ink-3);font-size:12px}
+.card .v{font-size:24px;font-family:var(--mono);font-variant-numeric:tabular-nums;margin-top:4px}
+.card .v small{font-size:12px;color:var(--ink-3);font-family:var(--sans)}
+
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:12px;margin-bottom:18px;overflow:hidden}
+.panel > header{display:flex;align-items:center;justify-content:space-between;padding:13px 16px;border-bottom:1px solid var(--line-soft);gap:10px}
+.panel > header h2{font-size:14px}
+.panel .body{padding:16px}
+.panel .body.flush{padding:0}
+
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:560;color:var(--ink-3);font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;padding:9px 12px;border-bottom:1px solid var(--line-soft);white-space:nowrap}
+td{padding:10px 12px;border-bottom:1px solid var(--line-soft);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+td.mono,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12.5px}
+td .sub{color:var(--ink-3);font-size:11.5px}
+.empty{padding:26px 16px;text-align:center;color:var(--ink-3);font-size:13px}
+
+.badge{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;font-size:11.5px;border:1px solid transparent}
+.badge.ok{background:var(--ok-soft);color:var(--ok)}
+.badge.warn{background:var(--warn-soft);color:var(--warn)}
+.badge.bad{background:var(--bad-soft);color:var(--bad)}
+.badge.mute{background:var(--surface-2);color:var(--ink-3);border-color:var(--line)}
+
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:860px){.shell{grid-template-columns:1fr}.nav{position:static;height:auto}.nav nav{flex-direction:row;flex-wrap:wrap}main{padding:16px}}
+
+.login{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:50}
+.login form{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:26px;width:min(360px,92vw);box-shadow:var(--shadow)}
+.login h2{font-size:16px;margin-bottom:14px}
+
+#toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:60}
+.toast{background:var(--raise);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:10px 14px;font-size:13px;box-shadow:var(--shadow);max-width:380px}
+.toast.bad{border-left-color:var(--bad)}
+.toast.ok{border-left-color:var(--ok)}
+pre.out{background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:10px;font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto}
+code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:1px 5px;border-radius:4px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.section-tabs{display:flex;gap:6px;margin-bottom:14px}
+.section-tabs button{border-radius:999px;padding:5px 12px;font-size:12.5px}
+.section-tabs button.on{background:var(--accent-soft);border-color:var(--accent);color:var(--ink)}
+</style>
+</head>
+<body>
+
+<div class="login" id="login" hidden>
+  <form id="loginForm">
+    <h2>Today2API 控制台</h2>
+    <label class="field"><span>面板密码</span><input type="password" id="loginPassword" autocomplete="current-password" required></label>
+    <button class="primary" type="submit" style="width:100%">登录</button>
+    <p class="hint" id="loginHint">密码在 config.json 的 panel_password。</p>
+  </form>
+</div>
+
+<div class="shell" id="shell">
+  <aside class="nav">
+    <div class="brand">
+      <div class="name">Today2API</div>
+      <div class="sub">Today → OpenAI · Codex · Claude</div>
+    </div>
+    <nav>
+      <a href="#overview" data-view="overview" class="active">概览</a>
+      <a href="#accounts" data-view="accounts">账号</a>
+      <a href="#keys" data-view="keys">密钥</a>
+      <a href="#settings" data-view="settings">设置</a>
+      <a href="#logs" data-view="logs">日志</a>
+    </nav>
+    <div class="foot">
+      <span id="footVersion">dev</span>
+      <button class="ghost" id="logoutBtn" title="退出登录" hidden>退出</button>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <h1 id="pageTitle">概览</h1>
+      <div class="row">
+        <span class="meta" id="listenMeta"></span>
+        <button class="ghost" id="refreshBtn">刷新</button>
+      </div>
+    </div>
+
+    <!-- 概览 -->
+    <section id="view-overview">
+      <div class="cards">
+        <div class="card"><div class="k">账号</div><div class="v" id="statAccounts">0</div></div>
+        <div class="card"><div class="k">启用</div><div class="v" id="statEnabled">0</div></div>
+        <div class="card"><div class="k">冷却中</div><div class="v" id="statCooling">0</div></div>
+        <div class="card"><div class="k">运行</div><div class="v" id="statUptime">-</div></div>
+      </div>
+
+      <div class="panel">
+        <header><h2>上游探针</h2><span class="hint">走完整网关链路发一条真实消息</span></header>
+        <div class="body">
+          <div class="row" style="margin-bottom:10px">
+            <select id="probeModel" style="max-width:240px"></select>
+            <button class="primary" id="probeBtn">发送测试</button>
+          </div>
+          <pre class="out" id="probeOut">未执行</pre>
+        </div>
+      </div>
+
+      <div class="panel">
+        <header><h2>最近请求</h2></header>
+        <div class="body flush" id="recentLogs"><div class="empty">暂无请求</div></div>
+      </div>
+    </section>
+
+    <!-- 账号 -->
+    <section id="view-accounts" hidden>
+      <div class="panel">
+        <header><h2>添加账号</h2></header>
+        <div class="body">
+          <div class="section-tabs">
+            <button class="on" data-addmode="cookie">粘贴 Cookie</button>
+            <button data-addmode="otp">邮箱验证码（仅国际版）</button>
+          </div>
+          <div id="addCookie">
+            <div class="grid2">
+              <label class="field"><span>区域</span>
+                <select id="addRealm"><option value="cn">国内版 todayai.cn</option><option value="global">国际版 today.ai</option></select>
+              </label>
+              <label class="field"><span>备注（可空）</span><input id="addLabel" placeholder="例如：主号"></label>
+            </div>
+            <label class="field"><span>Cookie</span>
+              <textarea id="addCookieText" rows="3" placeholder="__Secure-better-auth.session_token=… 或整段 Cookie 头"></textarea>
+              <span class="hint">浏览器登录 todayai.cn / today.ai → F12 → Application → Cookies → 复制 session_token。</span>
+            </label>
+            <button class="primary" id="addCookieBtn">校验并添加</button>
+          </div>
+          <div id="addOtp" hidden>
+            <div class="grid2">
+              <label class="field"><span>邮箱</span><input id="otpEmail" type="email" placeholder="you@example.com"></label>
+              <label class="field"><span>区域</span><select id="otpRealm"><option value="global">国际版 today.ai</option><option value="cn">国内版 todayai.cn</option></select></label>
+            </div>
+            <div class="row" style="margin-bottom:12px">
+              <button id="otpSendBtn">发送验证码</button>
+              <input id="otpCode" placeholder="邮件里的验证码" style="max-width:180px">
+              <button class="primary" id="otpVerifyBtn">登录并添加</button>
+            </div>
+            <p class="hint">国内版已关闭邮箱登录（上游返回 auth.email_sign_in_disabled），请用 Cookie 方式。</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <header><h2>账号池</h2></header>
+        <div class="body flush" id="accountTable"><div class="empty">还没有账号</div></div>
+      </div>
+    </section>
+
+    <!-- 密钥 -->
+    <section id="view-keys" hidden>
+      <div class="panel">
+        <header><h2>下游密钥</h2></header>
+        <div class="body">
+          <div class="row" style="margin-bottom:12px">
+            <input id="keyName" placeholder="名称，例如 laptop" style="max-width:220px">
+            <button class="primary" id="keyCreateBtn">创建</button>
+          </div>
+          <pre class="out" id="keyOut" hidden></pre>
+        </div>
+        <div class="body flush" id="keyTable"></div>
+      </div>
+      <div class="panel">
+        <header><h2>客户端接法</h2></header>
+        <div class="body">
+          <p class="hint" style="margin-bottom:8px">没配密钥时不校验鉴权，仅建议本机使用。</p>
+          <pre class="out" id="usageSnippet"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section id="view-settings" hidden>
+      <div class="panel">
+        <header><h2>运行参数</h2></header>
+        <div class="body">
+          <div class="grid2">
+            <label class="field"><span>默认模型</span><input id="cfgModel"></label>
+            <label class="field"><span>回复超时（秒）</span><input id="cfgTimeout" type="number" min="30"></label>
+            <label class="field"><span>轮询间隔（毫秒）</span><input id="cfgPoll" type="number" min="50"></label>
+            <label class="field"><span>历史轮数（0 = 只发当前消息）</span><input id="cfgTurns" type="number" min="0"></label>
+          </div>
+          <label class="field"><span>面板密码（留空 = 仅本机可管理）</span><input id="cfgPassword" type="password" placeholder="不修改请留空"></label>
+          <button class="primary" id="cfgSaveBtn">保存</button>
+        </div>
+      </div>
+      <div class="panel">
+        <header><h2>上游地址</h2></header>
+        <div class="body flush" id="upstreamTable"></div>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section id="view-logs" hidden>
+      <div class="panel">
+        <header><h2>请求日志</h2><span class="hint">最近 100 条，含流式请求</span></header>
+        <div class="body flush" id="logTable"><div class="empty">暂无请求</div></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>
