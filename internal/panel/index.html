@@ -128,6 +128,7 @@ code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:
     <nav>
       <a href="#overview" data-view="overview" class="active">概览</a>
       <a href="#accounts" data-view="accounts">账号</a>
+      <a href="#growth" data-view="growth">签到 · 任务</a>
       <a href="#keys" data-view="keys">密钥</a>
       <a href="#settings" data-view="settings">设置</a>
       <a href="#logs" data-view="logs">日志</a>
@@ -216,6 +217,44 @@ code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:
       </div>
     </section>
 
+    <!-- 签到 · 任务 -->
+    <section id="view-growth" hidden>
+      <div class="panel">
+        <header>
+          <h2>每日签到</h2>
+          <span class="hint">读 /v1/rapport → 上报客户端可申报动作 → 比对积分</span>
+        </header>
+        <div class="body">
+          <div class="row" style="margin-bottom:12px">
+            <button class="primary" id="checkinAllBtn">全部账号签到</button>
+            <span class="hint">两条动作上游幂等，重复跑不会重复计分</span>
+          </div>
+          <div id="checkinResult"><div class="empty">尚未执行</div></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <header>
+          <h2>账号详情</h2>
+          <div class="row">
+            <select id="growthAccount" style="max-width:260px"></select>
+            <button class="ghost" id="checkinOneBtn">单独签到</button>
+            <button class="ghost" id="growthRefreshBtn">刷新</button>
+          </div>
+        </header>
+        <div class="body" id="rapportBody"><div class="empty">先在上方选择账号</div></div>
+      </div>
+
+      <div class="panel">
+        <header>
+          <h2>任务</h2>
+          <span class="hint">/v1/tasks 系列</span>
+        </header>
+        <div class="body flush" id="taskTable"><div class="empty">先在上方选择账号</div></div>
+        <div class="body" id="taskRecommended"></div>
+      </div>
+    </section>
+
     <!-- 密钥 -->
     <section id="view-keys" hidden>
       <div class="panel">
@@ -248,7 +287,13 @@ code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:
             <label class="field"><span>回复超时（秒）</span><input id="cfgTimeout" type="number" min="30"></label>
             <label class="field"><span>轮询间隔（毫秒）</span><input id="cfgPoll" type="number" min="50"></label>
             <label class="field"><span>历史轮数（0 = 只发当前消息）</span><input id="cfgTurns" type="number" min="0"></label>
-          </div>
+            </div>
+            <div class="grid2">
+              <label class="field"><span>后台自动签到</span>
+                <select id="cfgCheckin"><option value="0">关闭</option><option value="1">开启</option></select>
+              </label>
+              <label class="field"><span>签到间隔（分钟）</span><input id="cfgCheckinMin" type="number" min="0" placeholder="720"></label>
+            </div>
           <label class="field"><span>面板密码（留空 = 仅本机可管理）</span><input id="cfgPassword" type="password" placeholder="不修改请留空"></label>
           <button class="primary" id="cfgSaveBtn">保存</button>
         </div>

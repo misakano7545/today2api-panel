@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
-const state = { data: null, view: "overview" };
+const state = { data: null, view: "overview", growth: { account: "", rapport: null, tasks: null } };
 
 const esc = (v) =>
   String(v == null ? "" : v).replace(/[&<>"']/g, (c) =>
@@ -177,8 +177,116 @@ function renderSettings(s) {
   $("#cfgTimeout").value = c.reply_timeout_sec;
   $("#cfgPoll").value = c.poll_interval_ms;
   $("#cfgTurns").value = c.context_turns;
+  $("#cfgCheckin").value = c.checkin && c.checkin.enabled ? "1" : "0";
+  $("#cfgCheckinMin").value = (c.checkin && c.checkin.interval_minutes) || 720;
   $("#cfgPassword").value = "";
   $("#cfgPassword").placeholder = c.panel_password_set ? "已设置；不修改请留空" : "留空 = 仅本机可管理";
+}
+
+/* ---------- 签到 · 任务 ---------- */
+
+function renderGrowthAccounts(s) {
+  const sel = $("#growthAccount");
+  const prev = state.growth.account || sel.value;
+  sel.innerHTML = s.accounts.length
+    ? s.accounts.map((a) => `<option value="${esc(a.id)}">${esc(a.label)} · ${a.realm === "cn" ? "国内" : "国际"}</option>`).join("")
+    : '<option value="">（无账号）</option>';
+  if (prev && s.accounts.some((a) => a.id === prev)) sel.value = prev;
+  state.growth.account = sel.value;
+}
+
+function renderRapport() {
+  const el = $("#rapportBody");
+  const r = state.growth.rapport;
+  if (!r) {
+    el.innerHTML = '<div class="empty">先在上方选择账号</div>';
+    return;
+  }
+  const rapport = r.rapport || {};
+  const rules = rapport.rules || [];
+  const done = rules.filter((x) => x.status === "completed").length;
+  el.innerHTML = `
+    <div class="cards" style="margin-bottom:14px">
+      <div class="card"><div class="k">积分</div><div class="v">${esc(rapport.points ?? "-")}</div></div>
+      <div class="card"><div class="k">等级</div><div class="v">${esc(rapport.levelKey || rapport.level || "-")}</div></div>
+      <div class="card"><div class="k">已完成规则</div><div class="v">${done}<small>/${rules.length}</small></div></div>
+    </div>
+    <table><thead><tr><th>规则</th><th>说明</th><th>分值</th><th>状态</th></tr></thead><tbody>
+    ${rules.length
+      ? rules.map((x) => `<tr>
+          <td>${esc(x.title || x.key)}<div class="sub mono">${esc(x.key)}</div></td>
+          <td class="sub">${esc([x.description, x.note].filter(Boolean).join(" · "))}</td>
+          <td class="mono">+${esc(x.points || 0)}</td>
+          <td>${x.status === "completed" ? badge("已入账", "ok") : badge(esc(x.status || "待完成"), "mute")}</td>
+        </tr>`).join("")
+      : '<tr><td colspan="4" class="empty">这个账号还没有规则卡片</td></tr>'}
+    </tbody></table>`;
+}
+
+function renderTasks() {
+  const el = $("#taskTable");
+  const rec = $("#taskRecommended");
+  const t = state.growth.tasks;
+  if (!t) {
+    el.innerHTML = '<div class="empty">先在上方选择账号</div>';
+    rec.innerHTML = "";
+    return;
+  }
+  const tasks = t.tasks || [];
+  el.innerHTML = tasks.length
+    ? `<table><thead><tr><th>任务</th><th>类型</th><th>状态</th><th>创建</th><th></th></tr></thead><tbody>
+      ${tasks.map((x) => `<tr>
+        <td>${esc(x.title || x.id)}<div class="sub mono">${esc(x.id)}</div></td>
+        <td class="mono">${esc(x.type || "-")}</td>
+        <td>${badge(esc(x.status || "-"), x.status === "completed" ? "ok" : x.status === "failed" ? "bad" : "mute")}</td>
+        <td class="mono">${fmtTime(x.createdAt)}</td>
+        <td>${["running", "queued"].includes(x.status)
+          ? `<button class="danger" data-task-stop="${esc(x.id)}">停止</button>`
+          : ""}</td>
+      </tr>`).join("")}</tbody></table>`
+    : '<div class="empty">没有任务</div>';
+
+  const recs = t.recommended || [];
+  rec.innerHTML = recs.length
+    ? `<p class="hint" style="margin-bottom:8px">推荐任务</p><div class="row">${recs
+        .map((x) => `<button class="ghost" data-task-apply="${esc(x.id)}">${esc(x.title || x.id)}</button>`)
+        .join("")}</div>`
+    : "";
+}
+
+async function loadGrowth() {
+  const id = $("#growthAccount") ? $("#growthAccount").value : "";
+  state.growth.account = id;
+  if (!id) return;
+  try {
+    const [rapport, tasks] = await Promise.all([
+      api(`/api/panel/accounts/${encodeURIComponent(id)}/rapport`).catch((e) => ({ error: e.message })),
+      api(`/api/panel/accounts/${encodeURIComponent(id)}/tasks`).catch((e) => ({ error: e.message })),
+    ]);
+    state.growth.rapport = rapport.error ? null : rapport;
+    state.growth.tasks = tasks.error ? null : tasks;
+    if (rapport.error) toast("积分拉取失败：" + rapport.error, "bad");
+    if (tasks.error) toast("任务拉取失败：" + tasks.error, "bad");
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+  renderRapport();
+  renderTasks();
+}
+
+function renderCheckinRows(rows) {
+  const el = $("#checkinResult");
+  if (!rows || !rows.length) {
+    el.innerHTML = '<div class="empty">没有启用中的账号</div>';
+    return;
+  }
+  el.innerHTML = `<table><thead><tr><th>账号</th><th>结果</th><th>积分变化</th><th>说明</th></tr></thead><tbody>
+    ${rows.map((r) => `<tr>
+      <td>${esc(r.label || r.account)}</td>
+      <td>${r.status === "ok" ? badge("已签到", "ok") : badge("失败", "bad")}</td>
+      <td class="mono">${r.delta > 0 ? "+" + r.delta : r.delta === 0 ? "±0" : r.delta}</td>
+      <td class="sub">${esc(r.detail || "")}</td>
+    </tr>`).join("")}</tbody></table>`;
 }
 
 function renderAll() {
@@ -186,6 +294,7 @@ function renderAll() {
   if (!s) return;
   renderOverview(s);
   renderAccounts(s);
+  renderGrowthAccounts(s);
   renderKeys(s);
   renderSettings(s);
   renderLogs(s.logs, "#logTable");
@@ -213,10 +322,11 @@ async function load() {
 function switchView(view) {
   state.view = view;
   document.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === view));
-  const names = { overview: "概览", accounts: "账号", keys: "密钥", settings: "设置", logs: "日志" };
+  const names = { overview: "概览", accounts: "账号", growth: "签到 · 任务", keys: "密钥", settings: "设置", logs: "日志" };
   document.querySelectorAll("main > section").forEach((sec) => (sec.hidden = sec.id !== "view-" + view));
   $("#pageTitle").textContent = names[view] || view;
   if (location.hash !== "#" + view) history.replaceState(null, "", "#" + view);
+  if (view === "growth" && state.data) loadGrowth();
 }
 
 document.querySelectorAll(".nav a").forEach((a) =>
@@ -301,6 +411,31 @@ $("#otpVerifyBtn").addEventListener("click", async () => {
 });
 
 document.addEventListener("click", async (e) => {
+  const stop = e.target.closest("button[data-task-stop]");
+  if (stop) {
+    const id = state.growth.account;
+    if (!confirm("终止这个任务？")) return;
+    try {
+      await api(`/api/panel/accounts/${encodeURIComponent(id)}/tasks/${encodeURIComponent(stop.dataset.taskStop)}/stop`, { method: "POST" });
+      toast("已终止", "ok");
+      await loadGrowth();
+    } catch (err) {
+      toast(err.message, "bad");
+    }
+    return;
+  }
+  const apply = e.target.closest("button[data-task-apply]");
+  if (apply) {
+    const id = state.growth.account;
+    try {
+      await api(`/api/panel/accounts/${encodeURIComponent(id)}/tasks/recommendations/${encodeURIComponent(apply.dataset.taskApply)}/apply`, { method: "POST" });
+      toast("已采纳推荐任务", "ok");
+      await loadGrowth();
+    } catch (err) {
+      toast(err.message, "bad");
+    }
+    return;
+  }
   const btn = e.target.closest("button[data-act]");
   if (btn) {
     const id = btn.dataset.id;
@@ -360,6 +495,10 @@ $("#cfgSaveBtn").addEventListener("click", async () => {
     reply_timeout_sec: Number($("#cfgTimeout").value),
     poll_interval_ms: Number($("#cfgPoll").value),
     context_turns: Number($("#cfgTurns").value),
+    checkin: {
+      enabled: $("#cfgCheckin").value === "1",
+      interval_minutes: Number($("#cfgCheckinMin").value) || 0,
+    },
   };
   const pwd = $("#cfgPassword").value;
   if (pwd) body.panel_password = pwd;
@@ -386,6 +525,49 @@ $("#probeBtn").addEventListener("click", async () => {
     out.textContent = "失败：" + err.message;
   }
   load();
+});
+
+$("#growthAccount").addEventListener("change", () => {
+  state.growth.account = $("#growthAccount").value;
+  loadGrowth();
+});
+$("#growthRefreshBtn").addEventListener("click", () => loadGrowth());
+
+$("#checkinOneBtn").addEventListener("click", async () => {
+  const id = state.growth.account;
+  if (!id) return toast("先选账号", "bad");
+  const btn = $("#checkinOneBtn");
+  btn.disabled = true;
+  btn.textContent = "签到中…";
+  try {
+    const r = await api(`/api/panel/accounts/${encodeURIComponent(id)}/checkin`, { method: "POST" });
+    const res = r.result || {};
+    toast(`签到完成 · 积分 ${res.delta > 0 ? "+" + res.delta : "±0"}`, "ok");
+    renderCheckinRows([{ label: r.label, account: r.account, status: "ok", delta: res.delta || 0 }]);
+    await loadGrowth();
+  } catch (err) {
+    toast(err.message, "bad");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "单独签到";
+  }
+});
+
+$("#checkinAllBtn").addEventListener("click", async () => {
+  const btn = $("#checkinAllBtn");
+  btn.disabled = true;
+  btn.textContent = "签到中…";
+  try {
+    const r = await api("/api/panel/checkin", { method: "POST" });
+    renderCheckinRows(r.rows || []);
+    toast(`签到完成：${r.ok} 成功 / ${r.failed} 失败`, r.failed ? "bad" : "ok");
+    await loadGrowth();
+  } catch (err) {
+    toast(err.message, "bad");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "全部账号签到";
+  }
 });
 
 /* ---------- 启动 ---------- */

@@ -51,13 +51,68 @@ export ANTHROPIC_API_KEY=sk-today-…
 
 ## 上游协议（为什么网关要翻译）
 
-Today 没有 `chat/completions`：
+> 以下全部以 **真实客户端（Today Desktop 1.24.0）静态逆向 + 上游实测** 为准。
+> 早期社区实现里的 `channel:"main"`、`202 + threadId`、`isMainChat=true` 轮询参数
+> 都与客户端不一致，已按客户端改写，详见 [`docs/reverse-engineering.md`](docs/reverse-engineering.md)。
 
-1. `POST /api/token`（带 Cookie）换一个分钟级过期的 API JWT；
-2. `POST /v1/messages` 只回 **202**（用户消息已入库），拿不到回答；
-3. 回答要靠 `GET /v1/conversations/messages?isMainChat=true` 轮询取回，正文逐次变长，`state=completed` 即终稿。
+Today 没有 `chat/completions`，链路是三步：
 
-所以「流式」是网关把轮询增量伪流式下发：首字 3~10 秒，正文按增量吐。轮询间隔默认 250ms，可在面板调。`channel: "main"` 是必填的，缺了这条消息不进主对话、后续永远查不到。
+1. **换票** — `POST {app}/api/token`，带 Cookie 与 `Origin`，body `{audience, expiresIn:3600}`，
+   返回 `{token, expiresAt}`（小时级 JWT）。桌面端同时会发 `X-App-Version` / `X-Client-Platform`
+   / `X-Device-Id` / `X-Timezone`，上游按这些头做版本与平台分支——缺了会掉进 legacy 分支。
+2. **发消息** — `POST /v1/messages`（canonical-v1）：
+
+   ```json
+   {
+     "body": { "parts": [ { "id": "<uuid>", "type": "text", "text": "…" } ] },
+     "clientMessageId": "<uuid>",
+     "isMainChat": true
+   }
+   ```
+
+   立刻返回 `{canonicalMessage:{…}}`——**这是用户自己那条消息**，不是回答。
+   指定会话时用 `isMainChat:false` + `conversationId`。
+3. **取回答** — `GET /v1/conversations/messages?conversationId=…&limit=N`，
+   在历史页里按 `originClientMessageId == 本轮 clientMessageId` 找到对应的 assistant 消息；
+   正文逐次变长，`isFinal` 或 `state=completed` 即终稿。
+
+所以「流式」是网关把轮询增量伪流式下发：首字 3~10 秒，之后按增量吐。
+轮询间隔默认 250ms，可在面板调。
+
+**模型选项是账号级的**：`PUT /v1/pricing/model-option {optionId}` 改的是这个账号的全局选择，
+不是每条消息带的参数。所以并发切模型会互相踩，网关内部把它串行化并按账号缓存当前选项。
+
+## 签到与做任务
+
+Today 没有独立的 `daily-checkin` 端点。每日互动由 `/v1/rapport` 的规则卡片承载：
+
+```bash
+GET  /api/panel/accounts/{id}/rapport   # 积分 / 等级 / 规则卡片快照
+POST /api/panel/accounts/{id}/checkin   # 读快照 → 上报动作 → 复读，返回积分 delta
+POST /api/panel/checkin                 # 全账号批量签到（并发 4）
+```
+
+客户端有权主动申报的动作只有两条（上游注释写明「规则与分值由服务端持有，
+客户端不能提供 rule key 或点数」）：
+
+- `POST /v1/rapport/actions/notification-enabled`
+- `POST /v1/rapport/actions/discord-joined`
+
+两条都是幂等的，重复跑不会重复计分，所以后台定时签到是安全的：
+
+```json
+"checkin": { "enabled": true, "interval_minutes": 720 }
+```
+
+做任务走 `/v1/tasks` 系列：
+
+| 面板接口 | 上游 |
+|---|---|
+| `GET /api/panel/accounts/{id}/tasks` | `/v1/tasks` + `/v1/tasks/summary` + `/v1/tasks/templates/types` + `/v1/tasks/recommendations` |
+| `GET /api/panel/tasks` | 跨账号聚合 `/v1/tasks` |
+| `POST …/tasks/{taskId}/stop` | `POST /v1/tasks/{id}/stop` |
+| `POST …/tasks/{taskId}/follow-up` | `POST /v1/tasks/{id}/follow-up` |
+| `POST …/tasks/recommendations/{recId}/apply` | `POST /v1/tasks/recommendations/{id}/apply` |
 
 ## 账号池行为
 
@@ -77,6 +132,8 @@ Today 没有 `chat/completions`：
 | `reply_timeout_sec` | 单轮等回答上限，默认 240 |
 | `poll_interval_ms` | 轮询间隔，默认 250 |
 | `context_turns` | 0 = 只发当前消息（Today 自己按会话记上下文）；N = 把最近 N 轮历史拼进正文 |
+| `checkin.enabled` | 是否后台自动签到，默认关闭 |
+| `checkin.interval_minutes` | 自动签到间隔，开启且为 0 时按 720（12 小时） |
 | `upstream.{cn,global}` | 三件套地址；留空用官方值，可指向自建中转 |
 | `keys[]` | 下游密钥（只存 sha256） |
 | `accounts[]` | 账号池（Cookie 明文，文件权限 0600） |
@@ -85,11 +142,14 @@ Today 没有 `chat/completions`：
 
 结构对照 [workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)：单二进制 + `cmd/` 入口 + `internal/{config,today,pool,server,panel}` 分层 + 内嵌单页面板 + 配置即状态。
 
-上游协议细节参考（均未直接拷贝代码）：
+协议事实源是本机安装的两个真实客户端（`C:\Program Files\Today` 国际版、`C:\Program Files\Today CN` 国内版），
+逆向过程、证据与「与仓库冲突时以客户端为准」的裁定记录见 [`docs/reverse-engineering.md`](docs/reverse-engineering.md)。
 
-- [shuaichao171/TodayProxy](https://github.com/shuaichao171/TodayProxy) — 两级鉴权、canonical 会话、`/v2/messages`
-- [MYCF711/magpie-today](https://github.com/MYCF711/magpie-today) — 载荷上限、登录态、会话语义
-- [jzPPP3333/cpa-today-plugin](https://github.com/jzPPP3333/cpa-today-plugin) — Go 实现参考（`channel:"main"`、轮询取回、模型选项）
+历史参考（早期社区实现，部分字段与客户端不符，仅作背景）：
+
+- [shuaichao171/TodayProxy](https://github.com/shuaichao171/TodayProxy)
+- [MYCF711/magpie-today](https://github.com/MYCF711/magpie-today)
+- [jzPPP3333/cpa-today-plugin](https://github.com/jzPPP3333/cpa-today-plugin)
 
 > ⚠️ 非官方网关：上游随时可能收紧，账号风控由使用者自负；请只用自己的账号，别拿去做对外中转。
 

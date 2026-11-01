@@ -187,6 +187,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			"context_turns":      cfg.ContextTurns,
 			"panel_password_set": cfg.PanelPassword != "",
 			"upstream":           cfg.Upstream,
+			"checkin":            cfg.Checkin,
 		},
 		"accounts": accounts,
 		"keys":     keyViews(cfg.Keys),
@@ -208,11 +209,12 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		DefaultModel    *string `json:"default_model"`
-		ReplyTimeoutSec *int    `json:"reply_timeout_sec"`
-		PollIntervalMs  *int    `json:"poll_interval_ms"`
-		ContextTurns    *int    `json:"context_turns"`
-		PanelPassword   *string `json:"panel_password"`
+		DefaultModel    *string         `json:"default_model"`
+		ReplyTimeoutSec *int            `json:"reply_timeout_sec"`
+		PollIntervalMs  *int            `json:"poll_interval_ms"`
+		ContextTurns    *int            `json:"context_turns"`
+		PanelPassword   *string         `json:"panel_password"`
+		Checkin         *config.Checkin `json:"checkin"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -233,6 +235,15 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.PanelPassword != nil {
 			c.PanelPassword = *body.PanelPassword
+		}
+		if body.Checkin != nil {
+			c.Checkin = *body.Checkin
+			if c.Checkin.IntervalMinutes < 0 {
+				c.Checkin.IntervalMinutes = 0
+			}
+			if c.Checkin.Enabled && c.Checkin.IntervalMinutes == 0 {
+				c.Checkin.IntervalMinutes = 720
+			}
 		}
 		return nil
 	})
