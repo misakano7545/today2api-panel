@@ -82,6 +82,7 @@ func main() {
 	dir := flag.String("dir", "relay-cert", "证书目录（CA + 叶子）")
 	verbose := flag.Bool("v", true, "打印每条转发")
 	dumpToken := flag.String("dump-token", "", "把客户端正在使用的 Bearer JWT 写到该文件（0600），用于离线复现请求")
+	cookieFile := flag.String("cookie-file", "relay-cookies.json", "签名会话 Cookie 的落盘文件，重启后仍能换票")
 	flag.Parse()
 
 	cert, _, err := ensureCert(*dir)
@@ -107,7 +108,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    *listen,
-		Handler: newHandler(upstreamClient, *verbose, *dumpToken),
+		Handler: newHandler(upstreamClient, *verbose, *dumpToken, *cookieFile),
 		TLSConfig: &tls.Config{
 			MinVersion:   tls.VersionTLS12,
 			Certificates: []tls.Certificate{*cert},
@@ -133,16 +134,23 @@ type handler struct {
 	// dumpToken 非空时，把客户端正在用的 Bearer JWT 落到该文件（0600），
 	// 便于用同一张票离线复现请求、抓完整报文。
 	dumpToken string
+
+	// cookieFile 存签名 Cookie 映射：中继重启后仍能把 raw token 还原成
+	// 可用的会话 Cookie，否则客户端下一次换票会 401。
+	cookieFile string
 }
 
-func newHandler(client *http.Client, verbose bool, dumpToken string) *handler {
-	return &handler{
-		client:    client,
-		verbose:   verbose,
-		signed:    map[string]string{},
-		lastSeen:  map[string]string{},
-		dumpToken: dumpToken,
+func newHandler(client *http.Client, verbose bool, dumpToken, cookieFile string) *handler {
+	h := &handler{
+		client:     client,
+		verbose:    verbose,
+		signed:     map[string]string{},
+		lastSeen:   map[string]string{},
+		dumpToken:  dumpToken,
+		cookieFile: cookieFile,
 	}
+	h.loadCookies()
+	return h
 }
 
 // captureBearer 把客户端正在用的 JWT 落盘。
@@ -188,7 +196,50 @@ func (h *handler) rememberCookie(host string, setCookies []string, body []byte) 
 			}
 		}
 		h.cookieMu.Unlock()
+		h.saveCookies()
 	}
+}
+
+// loadCookies 启动时恢复映射。
+func (h *handler) loadCookies() {
+	if h.cookieFile == "" {
+		return
+	}
+	raw, err := os.ReadFile(h.cookieFile)
+	if err != nil {
+		return
+	}
+	var out struct {
+		Signed   map[string]string `json:"signed"`
+		LastSeen map[string]string `json:"last_seen"`
+	}
+	if json.Unmarshal(raw, &out) != nil {
+		return
+	}
+	if out.Signed != nil {
+		h.signed = out.Signed
+	}
+	if out.LastSeen != nil {
+		h.lastSeen = out.LastSeen
+	}
+	h.logf("已恢复 %d 条会话 Cookie 映射", len(h.signed))
+}
+
+// saveCookies 落盘（0600）。Cookie 是登录态，权限必须收紧。
+func (h *handler) saveCookies() {
+	if h.cookieFile == "" {
+		return
+	}
+	h.cookieMu.Lock()
+	defer h.cookieMu.Unlock()
+	raw, err := json.MarshalIndent(struct {
+		Signed   map[string]string `json:"signed"`
+		LastSeen map[string]string `json:"last_seen"`
+	}{h.signed, h.lastSeen}, "", " ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(h.cookieFile, raw, 0o600)
 }
 
 // resolveCookie 把客户端手里的 raw token 换成签名 Cookie 值。
