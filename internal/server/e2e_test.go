@@ -17,11 +17,12 @@ import (
 
 // mockToday 是上游的替身：实现 token 换票、发消息、轮询回复三段。
 type mockToday struct {
-	mu     sync.Mutex
-	polls  int
-	texts  []string // assistant 正文的逐次快照，最后一次视为终稿
-	prompt string
-	sent   []map[string]any
+	mu              sync.Mutex
+	polls           int
+	texts           []string // assistant 正文的逐次快照，最后一次视为终稿
+	prompt          string
+	sent            []map[string]any
+	clientMessageID string
 }
 
 func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
@@ -39,17 +40,21 @@ func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
 				w.WriteHeader(http.StatusForbidden)
 				return
 			}
-			_, _ = w.Write([]byte(`{"token":"jwt-test","expiresIn":600}`))
+			_, _ = w.Write([]byte(`{"token":"jwt-test","expiresAt":"2099-01-01T00:00:00Z"}`))
+		case r.URL.Path == "/v1/config":
+			_, _ = w.Write([]byte(`{"data":{"messageProtocolVersion":"canonical-v1","mainConversationId":"main","supportsTypedBody":true}}`))
 		case r.URL.Path == "/v1/users/me":
 			_, _ = w.Write([]byte(`{"id":"u1","email":"u1@example.com","plan":"pro"}`))
 		case r.URL.Path == "/v1/pricing/status":
 			_, _ = w.Write([]byte(`{"data":{"status":{"plan":{"id":"pro"},"modelOptions":{"selectedOptionId":"model.deepseek-v4.1-flash","availableOptions":[{"optionId":"model.deepseek-v4.1-flash"},{"optionId":"model.glm-5.3"}]}}}}`))
+		case r.URL.Path == "/v1/llm/models":
+			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"deepseek-v4.1-flash"}]}}`))
 		case r.URL.Path == "/v1/pricing/model-option" && r.Method == http.MethodPut:
 			if r.Header.Get("Authorization") != "Bearer jwt-test" {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
-			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":{"modelOptions":{"selectedOptionId":"model.deepseek-v4.1-flash"}}}`))
 		case r.URL.Path == "/v1/messages":
 			if r.Header.Get("Authorization") != "Bearer jwt-test" {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -57,14 +62,22 @@ func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
 			}
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			clientMessageID, _ := body["clientMessageId"].(string)
+			prompt := mockPrompt(body)
 			m.mu.Lock()
 			m.sent = append(m.sent, body)
-			if s, ok := body["content"].(string); ok {
-				m.prompt = s
-			}
+			m.prompt = prompt
+			m.clientMessageID = clientMessageID
 			m.mu.Unlock()
-			w.WriteHeader(http.StatusAccepted)
-			_, _ = w.Write([]byte(`{"threadId":"thr-1","messageId":"msg-1"}`))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"canonicalMessage": map[string]any{
+					"id": "msg-user", "conversationId": "main", "role": "user",
+					"clientMessageId": clientMessageID, "state": "completed", "isFinal": true,
+					"body": map[string]any{"parts": []any{map[string]any{
+						"messageType": "text", "content": map[string]any{"text": prompt},
+					}}},
+				},
+			})
 		case r.URL.Path == "/v1/conversations/messages":
 			m.mu.Lock()
 			idx := m.polls
@@ -74,14 +87,17 @@ func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
 			m.polls++
 			text := m.texts[idx]
 			final := idx == len(m.texts)-1
+			clientMessageID := m.clientMessageID
 			m.mu.Unlock()
-			state := "running"
+			state := "in_progress"
 			if final {
 				state = "completed"
 			}
 			payload := map[string]any{
 				"data": map[string]any{"items": []any{map[string]any{
-					"threadId": "thr-1", "role": "assistant", "state": state, "isFinal": final,
+					"id": "msg-assistant", "conversationId": "main", "role": "assistant",
+					"state": state, "isFinal": final,
+					"originClientMessageId": clientMessageID,
 					"body": map[string]any{"parts": []any{map[string]any{
 						"messageType": "text", "content": map[string]any{"text": text},
 					}}},
@@ -94,6 +110,20 @@ func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
 	}))
 	t.Cleanup(srv.Close)
 	return srv, m
+}
+
+// mockPrompt 从 canonical-v1 请求体里抽出正文，模拟上游“用户消息入库”的检查点。
+func mockPrompt(body map[string]any) string {
+	b, _ := body["body"].(map[string]any)
+	parts, _ := b["parts"].([]any)
+	var out strings.Builder
+	for _, p := range parts {
+		part, _ := p.(map[string]any)
+		if s, ok := part["text"].(string); ok {
+			out.WriteString(s)
+		}
+	}
+	return out.String()
 }
 
 // newTestServer 组装一个指向 mock 上游的网关。
@@ -179,8 +209,8 @@ func TestChatCompletionsNonStream(t *testing.T) {
 	if !strings.Contains(mock.prompt, "你是助手") || !strings.Contains(mock.prompt, "你好") {
 		t.Fatalf("prompt = %q", mock.prompt)
 	}
-	if channel, _ := mock.sent[0]["channel"].(string); channel != "main" {
-		t.Fatalf("channel = %q（缺了它上游查不到 thread）", channel)
+	if isMain, _ := mock.sent[0]["isMainChat"].(bool); !isMain {
+		t.Fatalf("isMainChat = %v（缺了它上游会当成子会话，取不到主对话回复）", mock.sent[0]["isMainChat"])
 	}
 }
 
