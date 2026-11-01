@@ -264,10 +264,9 @@ code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:
           </div>
           <textarea id="memContent" rows="8" placeholder="# 要记住的内容&#10;&#10;写成 markdown，越具体越好"></textarea>
           <div class="hint" style="margin-top:8px">
-            填了路径就是<b>定点写入</b>：必须是 <code>/memory/&lt;...&gt;</code> 形态，
-            目录不存在会自动建；同路径再写是<b>替换</b>（旧版本归档到 <code>history/</code>）。
-            留空则由上游 agent 自己决定落点，可能合并进已有文件。
-            两种方式正文都可能被 agent 追加「来源」说明。
+            导入是异步的：上游起后台任务，agent 抽取后自己决定落目录与正文组织，
+            11–21 秒完成，可能合并进已有文件、也可能给正文加「来源」脚注。
+            要精确改某一行，请用上面的「精确覆写」。
           </div>
           <div id="memImportResult" style="margin-top:12px"><div class="empty">尚未导入</div></div>
         </div>
