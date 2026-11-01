@@ -65,10 +65,13 @@ type Upstream struct {
 
 // Account 是一个 Today 账号。Cookie 是登录态原文，只存服务端。
 type Account struct {
-	ID      string    `json:"id"`
-	Label   string    `json:"label,omitempty"`
-	Realm   string    `json:"realm"` // cn | global
-	Cookie  string    `json:"cookie"`
+	ID     string `json:"id"`
+	Label  string `json:"label,omitempty"`
+	Realm  string `json:"realm"` // cn | global
+	Cookie string `json:"cookie"`
+	// Token 是可选的静态 API JWT：给了就直接用，不再走 Cookie 换票。
+	// 上游 JWT 只有 1 小时寿命，适合临时验证；长期请用 Cookie。
+	Token   string    `json:"token,omitempty"`
 	Enabled bool      `json:"enabled"`
 	AddedAt time.Time `json:"added_at"`
 	Plan    string    `json:"plan,omitempty"` // 最近一次探测到的套餐

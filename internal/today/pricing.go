@@ -90,23 +90,51 @@ func (c *Client) LLMModels(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
-// EnsureModel 把账号切到指定模式；已经是该模式时直接返回。
+// EnsureModel 把账号切到指定模型/模式；已经是目标值时直接返回。
 //
-// 上游的模式选择是「账号全局」的（PUT /v1/pricing/model-option），
-// 不是每条消息带参数，所以并发切模式会互相踩——调用方需要串行化。
-func (c *Client) EnsureModel(ctx context.Context, optionID string) error {
-	if optionID == "" {
+// 实测两个区域的选项体系**不一样**：
+//
+//	国内版 pro: model.deepseek-v4.1-flash / model.minimax-m31-flash / model.glm-5.3
+//	国际版 free: mode.balanced / mode.power
+//
+// 所以不能靠拼前缀猜 id，必须拿账号自己的 available options 去匹配；
+// 匹配不到时保持当前选择（不能因此让整轮请求失败）。
+//
+// 另外：对已选中的选项再 PUT 会被拒（403 auth.forbidden），
+// 所以先读 pricing/status 对齐，只有真不一样才 PUT。
+func (c *Client) EnsureModel(ctx context.Context, requested string) error {
+	if requested == "" {
 		return nil
 	}
+	want := normalizeOptionName(requested)
+
+	st, err := c.Pricing(ctx)
+	if err != nil {
+		// 读不到目录就保守处理：不动账号设置，直接用当前选择。
+		return nil
+	}
+	selected := st.ModelOptions.SelectedOptionID
 	c.mu.Lock()
-	current := c.option
+	c.option = selected
 	c.mu.Unlock()
-	if current == optionID {
+	if normalizeOptionName(selected) == want {
+		return nil
+	}
+
+	target := ""
+	for _, opt := range st.ModelOptions.Options {
+		if normalizeOptionName(opt.ID) == want {
+			target = opt.ID
+			break
+		}
+	}
+	if target == "" {
+		// 该账号没有这个选项：不切，继续用当前选择。
 		return nil
 	}
 
 	status, raw, err := c.putJSON(ctx, "/v1/pricing/model-option", "pricing/model-option",
-		map[string]any{"optionId": optionID})
+		map[string]any{"optionId": target})
 	if err != nil {
 		return err
 	}
@@ -117,7 +145,7 @@ func (c *Client) EnsureModel(ctx context.Context, optionID string) error {
 			} `json:"modelOptions"`
 		} `json:"data"`
 	}
-	selected := optionID
+	selected = target
 	if status == http.StatusOK && len(raw) > 0 && json.Unmarshal(raw, &echoed) == nil {
 		if echoed.Data.ModelOptions.SelectedOptionID != "" {
 			selected = echoed.Data.ModelOptions.SelectedOptionID
@@ -129,22 +157,27 @@ func (c *Client) EnsureModel(ctx context.Context, optionID string) error {
 	return nil
 }
 
-// OptionID 把对外模型名转成上游的选项 id。
+// OptionID 把对外模型名归一成上游选项名（不做前缀猜测）。
 //
-// 上游有两套名字：
-//   - 模式（可 PUT 切换）：mode.balanced / mode.power
-//   - 模型 id（只读清单）：claude-opus-5 / gpt-5.5 …
-//
-// 对外暴露 `today-` 前缀，去掉后若本来就是 mode.* 或 model.* 则原样透传；
-// 其余按模式名处理（balanced → mode.balanced）。
+// 两个区域的选项体系不同（model.* vs mode.*），真正的 id 必须从
+// 账号的 pricing/status 里取；这里只负责把对外的 `today-` 前缀去掉。
 func OptionID(model string) string {
 	m := strings.TrimSpace(model)
 	m = strings.TrimPrefix(m, "today-")
-	if m == "" {
-		return ""
+	return m
+}
+
+// normalizeOptionName 抽出可比对的核心名：
+// `model.deepseek-v4.1-flash` / `today-deepseek-v4.1-flash` / `deepseek-v4.1-flash`
+// 都归一成 `deepseek-v4.1-flash`。
+func normalizeOptionName(name string) string {
+	n := strings.TrimSpace(strings.ToLower(name))
+	n = strings.TrimPrefix(n, "today-")
+	for _, prefix := range []string{"model.", "mode."} {
+		if strings.HasPrefix(n, prefix) {
+			n = strings.TrimPrefix(n, prefix)
+			break
+		}
 	}
-	if strings.HasPrefix(m, "mode.") || strings.HasPrefix(m, "model.") {
-		return m
-	}
-	return "mode." + m
+	return n
 }

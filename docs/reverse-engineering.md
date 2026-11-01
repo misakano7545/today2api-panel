@@ -692,3 +692,38 @@ GET  /v3/conversations/{id}/messages→ 200（另一套历史分页）
 
 国际版同链路只有邮箱 OTP（`email-otp/send-verification-otp` → `sign-in/email-otp`），
 且新号 `plan:"free"` 无对话额度。
+
+### 8.8 两个区域的模型选项体系不一样（重要）
+
+同一套网关代码要同时跑国内版和国际版，这一条必须知道：
+
+| 区域 / 套餐 | `modelOptions.selectedOptionId` | `options[].id` |
+|---|---|---|
+| 国内版 pro | `model.deepseek-v4.1-flash` | `model.deepseek-v4.1-flash`、`model.minimax-m31-flash`、`model.glm-5.3` |
+| 国际版 free | `mode.balanced` | `mode.balanced`、`mode.power` |
+
+即：**国内版是"选具体模型"，国际版是"选模式"**，前缀分别是 `model.` 和 `mode.`。
+
+两个后果：
+
+1. 不能靠拼前缀猜 id（`mode.` + 名字 会被国内版拒成
+   `403 auth.forbidden「你没有权限执行此操作。」`）。必须先读
+   `GET /v1/pricing/status`，拿账号自己的 `options` 去匹配；
+2. **对已选中的选项再 PUT 也会 403**。所以流程必须是：
+   读目录 → 比对 `selectedOptionId` → 相同就不发 PUT → 不同才 PUT；
+   目录里找不到目标值时保持当前选择，而不是让整轮请求失败。
+
+网关实现见 `internal/today/pricing.go` 的 `EnsureModel` / `normalizeOptionName`
+（`model.` / `mode.` / `today-` 前缀都归一掉再比）。
+
+### 8.9 三协议端到端实测（真实 CN pro 账号）
+
+```
+POST /v1/chat/completions  → 200  3.8s  "我是豆皮，你的 AI 助手…"
+POST /v1/messages          → 200        Anthropic 形状
+POST /v1/responses         → 200  4.9s  Codex 形状
+POST /v1/chat/completions (stream) → 200 SSE，delta 分块
+```
+
+> 注意：命令行里直接塞中文会被 MSYS 按 GBK 传出去，上游存成乱码。
+> 测中文请用 UTF-8 文件 + `--data-binary @file`。这不是网关的问题。

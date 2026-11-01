@@ -63,7 +63,7 @@ func (p *Pool) Pick(accounts []config.Account, cfg config.Config, skip map[strin
 
 	var candidates []config.Account
 	for _, a := range accounts {
-		if !a.Enabled || skip[a.ID] || a.Cookie == "" {
+		if !a.Enabled || skip[a.ID] || (a.Cookie == "" && a.Token == "") {
 			continue
 		}
 		if st := p.state[a.ID]; st != nil && time.Now().Before(st.Cooldown) {
@@ -80,9 +80,10 @@ func (p *Pool) Pick(accounts []config.Account, cfg config.Config, skip map[strin
 	p.next++
 
 	st := p.state[pick.ID]
-	if st == nil || st.Client == nil || st.Client.Cookie != pick.Cookie {
+	if st == nil || st.Client == nil || st.Client.Cookie != pick.Cookie || st.Client.StaticToken != pick.Token {
 		ep := cfg.EndpointsFor(pick.Realm)
 		client := today.NewClient(pick.Realm, pick.Cookie, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience})
+		client.StaticToken = pick.Token
 		client.Interval = time.Duration(cfg.PollIntervalMs) * time.Millisecond
 		if st == nil {
 			st = &State{}
@@ -103,9 +104,10 @@ func (p *Pool) ClientOf(a config.Account, cfg config.Config) *today.Client {
 		st = &State{}
 		p.state[a.ID] = st
 	}
-	if st.Client == nil || st.Client.Cookie != a.Cookie {
+	if st.Client == nil || st.Client.Cookie != a.Cookie || st.Client.StaticToken != a.Token {
 		ep := cfg.EndpointsFor(a.Realm)
 		client := today.NewClient(a.Realm, a.Cookie, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience})
+		client.StaticToken = a.Token
 		client.Interval = time.Duration(cfg.PollIntervalMs) * time.Millisecond
 		st.Client = client
 	}

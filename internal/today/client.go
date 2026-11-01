@@ -117,11 +117,13 @@ type Client struct {
 	Cookie   string
 	Interval time.Duration // 轮询间隔
 	HC       *http.Client
+	// StaticToken 非空时直接用这张 JWT，跳过 /api/token 换票（临时验证用）。
+	StaticToken string
 
 	mu       sync.Mutex
 	jwt      string
 	jwtExp   time.Time
-	option   string       // 该账号当前生效的模型选项，避免每次请求都 PUT
+	option   string        // 该账号当前生效的模型选项，避免每次请求都 PUT
 	cfg      *ClientConfig // /v1/config 协商结果
 	cfgAt    time.Time
 	deviceID string
@@ -162,6 +164,9 @@ func (c *Client) DeviceID() string {
 
 // Token 换出 API JWT（提前 60s 续期）。
 func (c *Client) Token(ctx context.Context) (string, error) {
+	if c.StaticToken != "" {
+		return c.StaticToken, nil
+	}
 	c.mu.Lock()
 	if c.jwt != "" && time.Now().Before(c.jwtExp.Add(-60*time.Second)) {
 		token := c.jwt
