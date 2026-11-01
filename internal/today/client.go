@@ -44,10 +44,15 @@ const (
 )
 
 // Bases 是一个区域的上游三件套。
+//
+// Audience 留空时用官方 API 域名；API 指向中转（例如前端同源代理
+// https://todayai.cn/api/cloud）时必须显式给官方 API，否则签出的 JWT
+// 受众不匹配，上游以 “Token introspection failed” 拒绝。
 type Bases struct {
-	App  string
-	API  string
-	Auth string
+	App      string
+	API      string
+	Auth     string
+	Audience string
 }
 
 // OfficialBases 返回官方地址。
@@ -134,8 +139,11 @@ func NewClient(realm, cookie string, bases Bases) *Client {
 	if bases.Auth == "" {
 		bases.Auth = def.Auth
 	}
+	if bases.Audience == "" {
+		bases.Audience = def.API
+	}
 	return &Client{
-		Bases:    Bases{App: trimSlash(bases.App), API: trimSlash(bases.API), Auth: trimSlash(bases.Auth)},
+		Bases:    Bases{App: trimSlash(bases.App), API: trimSlash(bases.API), Auth: trimSlash(bases.Auth), Audience: trimSlash(bases.Audience)},
 		Cookie:   cookie,
 		Interval: 250 * time.Millisecond,
 		HC:       &http.Client{Timeout: 60 * time.Second},
@@ -180,7 +188,8 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 // 上游返回 {token, expiresAt}；兼容只给 expiresIn 的老响应。
 // {auth}/api/token 兜底——部分区域只在 auth 域名暴露该路由。
 func (c *Client) fetchToken(ctx context.Context) (string, time.Time, error) {
-	body, _ := json.Marshal(map[string]any{"audience": c.API, "expiresIn": 3600})
+	// audience 是 JWT 受众，恒为官方 API；c.API 只是实际调用地址（可能是中转）。
+	body, _ := json.Marshal(map[string]any{"audience": c.Audience, "expiresIn": 3600})
 	var lastErr error
 	for _, endpoint := range []string{c.App + "/api/token", c.Auth + "/api/token"} {
 		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))

@@ -18,10 +18,43 @@ import (
 )
 
 // Endpoints 是一个区域的上游三件套；留空则用官方默认值。
+//
+// Audience 是换票时请求的 JWT 受众，默认等于官方 API 域名。当 API 指向
+// 中转（例如前端同源代理 https://todayai.cn/api/cloud）时必须单独指定，
+// 否则签出来的 JWT 受众不匹配，上游会以 “Token introspection failed” 拒绝。
 type Endpoints struct {
-	App  string `json:"app,omitempty"`
-	API  string `json:"api,omitempty"`
-	Auth string `json:"auth,omitempty"`
+	App      string `json:"app,omitempty"`
+	API      string `json:"api,omitempty"`
+	Auth     string `json:"auth,omitempty"`
+	Audience string `json:"audience,omitempty"`
+}
+
+// ProxyEndpoints 返回「走前端同源代理」的默认地址。
+//
+// 背景（实测）：api.todayai.cn / auth.todayai.cn 前面的 AWS ALB 会按源 IP
+// 直接回 403 + text/html，而前端站点本身（todayai.cn / today.ai）挂在别处、
+// 且带 Next.js rewrite：
+//
+//	/api/cloud/:path*  →  https://api.todayai.cn/:path*
+//
+// 这条 rewrite 是**服务端**转发，所以从被 ALB 拦掉的网络里，改走
+// {app}/api/cloud 就能正常访问上游 API。auth 同理：前端站点上也有
+// /api/auth/[...all]，{app} 可以同时当 Auth 用。
+func ProxyEndpoints(realm string) Endpoints {
+	if realm == "cn" {
+		return Endpoints{
+			App:      "https://todayai.cn",
+			Auth:     "https://todayai.cn",
+			API:      "https://todayai.cn/api/cloud",
+			Audience: "https://api.todayai.cn",
+		}
+	}
+	return Endpoints{
+		App:      "https://today.ai",
+		Auth:     "https://today.ai",
+		API:      "https://today.ai/api/cloud",
+		Audience: "https://api.today.ai",
+	}
 }
 
 // Upstream 分国内版（todayai.cn）与国际版（today.ai）。两边的 Cookie 不通用。
@@ -123,6 +156,10 @@ func (c *Config) Normalize() {
 		}
 		if pair.dst.Auth == "" {
 			pair.dst.Auth = pair.def.Auth
+		}
+		// 受众恒指官方 API：API 可以换中转，JWT 受众不能跟着变。
+		if pair.dst.Audience == "" {
+			pair.dst.Audience = pair.def.API
 		}
 	}
 	for i := range c.Accounts {

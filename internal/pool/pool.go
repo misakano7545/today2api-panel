@@ -82,7 +82,7 @@ func (p *Pool) Pick(accounts []config.Account, cfg config.Config, skip map[strin
 	st := p.state[pick.ID]
 	if st == nil || st.Client == nil || st.Client.Cookie != pick.Cookie {
 		ep := cfg.EndpointsFor(pick.Realm)
-		client := today.NewClient(pick.Realm, pick.Cookie, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth})
+		client := today.NewClient(pick.Realm, pick.Cookie, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience})
 		client.Interval = time.Duration(cfg.PollIntervalMs) * time.Millisecond
 		if st == nil {
 			st = &State{}
@@ -105,7 +105,7 @@ func (p *Pool) ClientOf(a config.Account, cfg config.Config) *today.Client {
 	}
 	if st.Client == nil || st.Client.Cookie != a.Cookie {
 		ep := cfg.EndpointsFor(a.Realm)
-		client := today.NewClient(a.Realm, a.Cookie, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth})
+		client := today.NewClient(a.Realm, a.Cookie, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience})
 		client.Interval = time.Duration(cfg.PollIntervalMs) * time.Millisecond
 		st.Client = client
 	}

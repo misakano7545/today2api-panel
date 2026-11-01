@@ -288,7 +288,7 @@ func (s *Server) addAccount(ctx context.Context, label, realm, cookie string) (*
 	}
 	cfg := s.store.Snapshot()
 	ep := cfg.EndpointsFor(realm)
-	client := today.NewClient(realm, cookie, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth})
+	client := today.NewClient(realm, cookie, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience})
 	client.HC = s.httpc
 	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -533,7 +533,7 @@ func (s *Server) handleOTPSend(w http.ResponseWriter, r *http.Request) {
 	ep := cfg.EndpointsFor(body.Realm)
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	if err := today.SendOTP(ctx, s.httpc, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth}, body.Email); err != nil {
+	if err := today.SendOTP(ctx, s.httpc, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience}, body.Email); err != nil {
 		writeError(w, http.StatusBadGateway, "发送验证码失败："+err.Error())
 		return
 	}
@@ -558,7 +558,7 @@ func (s *Server) handleOTPVerify(w http.ResponseWriter, r *http.Request) {
 	ep := cfg.EndpointsFor(body.Realm)
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	cookie, err := today.SignInOTP(ctx, s.httpc, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth}, body.Email, body.Code)
+	cookie, err := today.SignInOTP(ctx, s.httpc, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience}, body.Email, body.Code)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "验证码登录失败："+err.Error())
 		return

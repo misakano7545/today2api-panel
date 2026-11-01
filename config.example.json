@@ -5,16 +5,22 @@
   "reply_timeout_sec": 240,
   "poll_interval_ms": 250,
   "context_turns": 0,
+  "checkin": {
+    "enabled": false,
+    "interval_minutes": 720
+  },
   "upstream": {
     "cn": {
       "app": "https://todayai.cn",
-      "api": "https://api.todayai.cn",
-      "auth": "https://auth.todayai.cn"
+      "auth": "https://todayai.cn",
+      "api": "https://todayai.cn/api/cloud",
+      "audience": "https://api.todayai.cn"
     },
     "global": {
       "app": "https://today.ai",
-      "api": "https://api.today.ai",
-      "auth": "https://auth.today.ai"
+      "auth": "https://today.ai",
+      "api": "https://today.ai/api/cloud",
+      "audience": "https://api.today.ai"
     }
   },
   "keys": [],
