@@ -449,3 +449,107 @@ for line in open(r"C:\Users\Administrator\AppData\Roaming\Today\logs\client.ndjs
         print(o["payload"])
 PY
 ```
+
+---
+
+## 7. 网络可达性：为什么桌面客户端登录失败而网页可以
+
+> 这一节是**实测结论**，不是推测。所有 403/401 都是当场跑出来的。
+
+### 7.1 现象
+
+桌面客户端（国际版 / 国内版都一样）登录页显示 **「账号服务当前不可用，请稍后重试。」**
+输入邮箱点提交，日志里是：
+
+```
+403 text/html  POST https://auth.today.ai/api/auth/email-otp/send-verification-otp
+403 text/html  GET  https://api.today.ai/v1/client/upgrade
+```
+
+而同一台机器上，浏览器打开 `todayai.cn` / `today.ai` 能正常登录（手机验证码）。
+
+### 7.2 403 的源头：不是客户端，是 AWS ALB 按源 IP 拦
+
+| 探测 | 结果 |
+|---|---|
+| `GET https://api.todayai.cn/v1/config` | `403 text/html`，`Server: awselb/2.0` |
+| 同上，换路径 `/`、`/healthz`、`/v1/nonexistent` | 一样 `403 text/html` |
+| 同上，换方法 GET/POST/PUT/OPTIONS | 一样 403 |
+| 同上，补齐 Chrome 全套头（UA/Sec-Fetch/Origin/Referer） | 一样 403 |
+| 同上，直连两个 ELB IP（`--resolve`） | 一样 403 |
+| 同上，**经境外中继**（不同源 IP） | **401 `Missing or invalid Authorization header`** ← 应用的真响应 |
+| `auth.today.ai` / `auth.todayai.cn` | 同上，403 text/html |
+| 本机出口 IP | `36.103.160.13`（宁夏中卫电信） |
+
+**结论**：`api.*` / `auth.*` 前面挂的是 AWS ALB，对本机这个出口 IP 段直接回
+`403 Forbidden`（空的 nginx 风格页面 + `awselb/2.0`），请求根本没到应用。
+换一个源 IP 就变成应用层的 `401`。这是**网络可达性问题，不是客户端 bug，也不是账号问题**。
+
+顺带：`github.com:443` 从这台机器也连不上（同样症状），说明是整体出口受限。
+
+### 7.3 网页为什么能登录：同源 + 服务端 rewrite
+
+国内版网页的登录（手机验证码）走 `todayai.cn` **同源**接口：
+
+```
+POST https://todayai.cn/api/auth/phone-number/send-otp      → 200  （短信真的发出去）
+POST https://todayai.cn/api/auth/phone-number/verify        → 走 better-auth
+GET  https://todayai.cn/api/auth/get-session                → 200
+```
+
+而网页拿数据用的 API，是 Next.js 的 **server-side rewrite**（`routes-manifest.json` 原文）：
+
+```json
+"rewrites": { "afterFiles": [
+  { "source": "/api/cloud/:path*",    "destination": "https://api.todayai.cn/:path*" },
+  { "source": "/api/cloud-cn/:path*", "destination": "https://api.todayai.cn/:path*" }
+]}
+```
+
+即 `https://todayai.cn/api/cloud/v1/xxx` 由**服务器**转发到 `api.todayai.cn`，
+浏览器这一跳根本不去碰被拦的 ALB。国际版同理：
+
+```
+GET https://today.ai/api/cloud/v1/config                  → 401 Missing or invalid Authorization header
+POST https://today.ai/api/auth/email-otp/...              → 200 {"success":true}
+```
+
+**这就是「网页能登录、客户端不能」的全部原因**：客户端直连 `api.*` / `auth.*`，
+网页全程只跟同源域名打交道。
+
+### 7.4 由此得到的可用通道（网关已采用）
+
+| 用途 | 地址 |
+|---|---|
+| App（换票 + 落地页） | `https://todayai.cn` / `https://today.ai` |
+| Auth（better-auth） | 同上（前端站点上就有 `/api/auth/[...all]`） |
+| API | `https://todayai.cn/api/cloud` / `https://today.ai/api/cloud` |
+| JWT 受众 | **仍是** `https://api.todayai.cn` / `https://api.today.ai`（不能跟着中转变） |
+
+`config.Endpoints.Audience` 就是为此加的：`API` 可以指中转，`Audience` 必须指官方域名，
+否则签出来的 JWT 受众不匹配，上游回 `Token introspection failed`。
+`config.ProxyEndpoints(realm)` 直接给出这套默认值。
+
+实测（假 Cookie，走代理通道）：
+
+```
+POST /api/panel/accounts/{id}/check
+→ 502 today auth: HTTP 401 {"error":"Unauthorized"}     ← better-auth 的真响应，链路通
+```
+
+对照未改配置时是 `403 text/html`（ALB 拦掉，根本没到应用）。
+
+### 7.5 桌面客户端为什么没有就地改好
+
+试过两条路，都失败并已**完整回滚**：
+
+1. **`resources/app` 目录覆盖** —— Electron 的解析顺序是 `app.asar` 优先于 `app/`，
+   把 asar 挪走后启动器直接报「Today 无法启动，请重置应用后重试」。
+2. **重打包 `app.asar`**（改 `DESKTOP_CLOUD_PUBLIC_CONFIG` 的 prod 段指向同源代理，
+   同时剥掉每文件的 `integrity`）—— 客户端能起来、也真的开始走 `today.ai/api/cloud`
+   （`201 POST /api/cloud/v1/client/logs`），但随后的启动自检仍然判定失败，
+   弹出同一个「Today 无法启动」+ 诊断编号。启动器对安装件有一层自己的校验，
+   不是单纯看文件在不在。
+
+> ⚠️ 结论：**不要就地改安装目录**。客户端要能登录，需要给它一条干净出口
+> （换网络 / 代理 / 手机热点），或者用下节的网关方案，不改客户端。
