@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
-const state = { data: null, view: "overview", growth: { account: "", rapport: null, tasks: null } };
+const state = { data: null, view: "overview", growth: { account: "", rapport: null, tasks: null }, memory: { account: "", data: null } };
 
 const esc = (v) =>
   String(v == null ? "" : v).replace(/[&<>"']/g, (c) =>
@@ -181,6 +181,83 @@ function renderSettings(s) {
   $("#cfgPassword").placeholder = c.panel_password_set ? "已设置；不修改请留空" : "留空 = 仅本机可管理";
 }
 
+/* ---------- 记忆 ---------- */
+
+function renderMemoryAccounts(s) {
+  const sel = $("#memAccount");
+  if (!sel) return;
+  const prev = state.memory.account || sel.value;
+  sel.innerHTML = s.accounts.length
+    ? s.accounts.map((a) => `<option value="${esc(a.id)}">${esc(a.label)}</option>`).join("")
+    : '<option value="">（无账号）</option>';
+  if (prev && s.accounts.some((a) => a.id === prev)) sel.value = prev;
+  state.memory.account = sel.value;
+}
+
+function renderMemoryPins() {
+  const el = $("#memPins");
+  const d = state.memory.data;
+  if (!d) {
+    el.innerHTML = '<div class="empty">先选择账号</div>';
+    return;
+  }
+  if (!d.pins || !d.pins.length) {
+    el.innerHTML = '<div class="empty">没有钉住的目录。下面钉一个，或先导入一条记忆。</div>';
+    return;
+  }
+  el.innerHTML = d.pins.map((p) => {
+    const files = (p.files || []).map((f) => `
+      <div style="margin:10px 0 0">
+        <div class="row" style="justify-content:space-between">
+          <strong>${esc(f.path)}</strong>
+          <span class="hint">${esc(f.contentType || "")}</span>
+        </div>
+        <pre class="log" style="white-space:pre-wrap;margin-top:6px">${esc(f.content || "（空）")}</pre>
+      </div>`).join("");
+    return `<div style="padding:12px 0;border-bottom:1px solid var(--line)">
+      <div class="row" style="justify-content:space-between">
+        <strong>${esc(p.path)}</strong>
+        <span class="hint">${(p.files || []).length} 个文件 · ${esc(p.pinnedAt || "")}</span>
+      </div>
+      ${files || '<div class="empty">这个目录下没有文件</div>'}
+    </div>`;
+  }).join("");
+}
+
+async function loadMemory() {
+  const id = $("#memAccount") ? $("#memAccount").value : "";
+  state.memory.account = id;
+  if (!id) return;
+  try {
+    state.memory.data = await api(`/api/panel/accounts/${encodeURIComponent(id)}/memories`);
+  } catch (err) {
+    state.memory.data = null;
+    toast("记忆拉取失败：" + err.message, "bad");
+  }
+  renderMemoryPins();
+}
+
+function renderMemoryImport(out) {
+  const el = $("#memImportResult");
+  if (!out) {
+    el.innerHTML = '<div class="empty">尚未导入</div>';
+    return;
+  }
+  if (out.error) {
+    el.innerHTML = `<div class="empty">失败：${esc(out.error)}</div>`;
+    return;
+  }
+  const t = out.task || {};
+  el.innerHTML = `<table><thead><tr><th>项</th><th>值</th></tr></thead><tbody>
+    <tr><td>文件</td><td>${esc((out.file && out.file.filename) || "")} · ${esc((out.file && out.file.id) || "")}</td></tr>
+    <tr><td>任务</td><td>${esc(t.id || "")}</td></tr>
+    <tr><td>状态</td><td>${t.status === "completed" ? badge("已完成", "ok") : badge(esc(t.status || "queued"), "")}</td></tr>
+    <tr><td>幂等</td><td>${out.idempotent ? "是（同一文件重复提交）" : "否"}</td></tr>
+    <tr><td>摘要</td><td>${esc((t.completionSummary || "（上游未返回）").slice(0, 400))}</td></tr>
+  </tbody></table>
+  <div class="hint" style="margin-top:8px">任务跑完后点上面的「刷新」看落地结果。</div>`;
+}
+
 /* ---------- 签到 · 任务 ---------- */
 
 function renderGrowthAccounts(s) {
@@ -293,9 +370,13 @@ function renderAll() {
   renderOverview(s);
   renderAccounts(s);
   renderGrowthAccounts(s);
+  renderMemoryAccounts(s);
   renderKeys(s);
   renderSettings(s);
   renderLogs(s.logs, "#logTable");
+  // switchView 可能早于账号就绪，那时 #memAccount 还是空的，
+  // 记忆页就停在「先选择账号」。等账号渲染完再补一次自动加载。
+  if (state.view === "memory" && !state.memory.data) loadMemory();
 }
 
 /* ---------- 数据 ---------- */
@@ -320,11 +401,12 @@ async function load() {
 function switchView(view) {
   state.view = view;
   document.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === view));
-  const names = { overview: "概览", accounts: "账号", growth: "签到 · 任务", keys: "密钥", settings: "设置", logs: "日志" };
+  const names = { overview: "概览", accounts: "账号", growth: "签到 · 任务", memory: "记忆", keys: "密钥", settings: "设置", logs: "日志" };
   document.querySelectorAll("main > section").forEach((sec) => (sec.hidden = sec.id !== "view-" + view));
   $("#pageTitle").textContent = names[view] || view;
   if (location.hash !== "#" + view) history.replaceState(null, "", "#" + view);
   if (view === "growth" && state.data) loadGrowth();
+  if (view === "memory" && state.data) loadMemory();
 }
 
 document.querySelectorAll(".nav a").forEach((a) =>
@@ -535,6 +617,82 @@ $("#checkinAllBtn").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
     btn.textContent = "全部账号签到";
+  }
+});
+
+$("#memRefreshBtn").addEventListener("click", () => loadMemory());
+
+$("#memAccount").addEventListener("change", () => {
+  state.memory.account = $("#memAccount").value;
+  loadMemory();
+});
+
+$("#memPinBtn").addEventListener("click", async () => {
+  const path = ($("#memPinPath").value || "").trim();
+  const id = state.memory.account;
+  if (!id) return toast("先选账号", "bad");
+  if (!path) return toast("填个目录，例如 /memory/notes", "bad");
+  try {
+    await api(`/api/panel/accounts/${encodeURIComponent(id)}/memories/pin`, {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    });
+    toast("已钉住 " + path, "ok");
+    await loadMemory();
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+});
+
+$("#memUnpinBtn").addEventListener("click", async () => {
+  const path = ($("#memPinPath").value || "").trim();
+  const id = state.memory.account;
+  if (!id) return toast("先选账号", "bad");
+  if (!path) return toast("填要取消的目录", "bad");
+  try {
+    await api(`/api/panel/accounts/${encodeURIComponent(id)}/memories/unpin`, {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    });
+    toast("已取消 " + path, "ok");
+    await loadMemory();
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+});
+
+$("#memImportBtn").addEventListener("click", async () => {
+  const btn = $("#memImportBtn");
+  const id = state.memory.account;
+  if (!id) return toast("先选账号", "bad");
+  const content = ($("#memContent").value || "").trim();
+  if (!content) return toast("内容不能为空", "bad");
+  const wait = $("#memWait").checked ? 45 : 0;
+
+  btn.disabled = true;
+  btn.textContent = wait ? "导入中…" : "提交中…";
+  try {
+    const out = await api(`/api/panel/accounts/${encodeURIComponent(id)}/memories/import`, {
+      method: "POST",
+      body: JSON.stringify({
+        filename: ($("#memFileName").value || "").trim() || "note.md",
+        content,
+        wait_sec: wait,
+      }),
+    });
+    renderMemoryImport(out);
+    if (out.terminal) {
+      toast("已写入，刷新可见", "ok");
+      await loadMemory();
+    } else {
+      toast("已排队，稍后点刷新", "");
+    }
+  } catch (err) {
+    renderMemoryImport({ error: err.message });
+    toast(err.message, "bad");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "导入";
   }
 });
 

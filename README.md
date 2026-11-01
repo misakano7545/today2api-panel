@@ -159,6 +159,38 @@ POST /api/panel/checkin                 # 全账号批量签到（并发 4）
 | `POST …/tasks/{taskId}/follow-up` | `POST /v1/tasks/{id}/follow-up` |
 | `POST …/tasks/recommendations/{recId}/apply` | `POST /v1/tasks/recommendations/{id}/apply` |
 
+## 记忆
+
+记忆在桌面上是 **WebDAV**（`PROPFIND /memory`），而 `api.todayai.cn/memory`
+被上游 ALB 按源 IP 拦掉，`/api/cloud` 的 Next rewrite 又承载不了 DAV
+（无 body → 边缘 400，带 body → 72s 超时 504）。所以网关**不走 DAV**，
+改走官方的 REST 通道。
+
+读：
+
+| 面板接口 | 上游 |
+|---|---|
+| `GET /api/panel/accounts/{id}/memories` | `/v1/memories/pins`（每个 pin 下最近三个文件的正文） |
+| `POST …/memories/pin` `{"path":"/memory/notes"}` | `/v1/memories/pins`（顺带校验目录是否存在） |
+| `POST …/memories/unpin` | `DELETE /v1/memories/pins` |
+
+写 —— 注意是**导入**语义，不是覆写：
+
+| 面板接口 | 上游 |
+|---|---|
+| `POST …/memories/import` `{"filename","content","wait_sec"}` | `POST /v1/files`（multipart）→ `POST /v1/memories/upload` `{fileRef}` → 轮询 `/v1/tasks/{id}` |
+
+上游会起一个后台任务，由 agent 抽取文件内容后**自己决定落盘到哪个目录、
+用什么文件名、正文怎么组织**，可能合并进已有文件（版本号继续涨）。
+所以：
+
+- 能「记一条新的」；
+- 不能「把第 3 行改成 X」——没有按行改写的接口，想要精确覆写得等 DAV 写可达；
+- 同一个 `fileRef` 重复提交幂等（回同一 task id + `idempotent: true`），
+  但换个文件传同样内容会再跑一次并叠加。
+
+任务详情在 `/v1/tasks/{id}`。**`/v2/tasks/{id}` 是 404 的空壳**。
+
 ## 账号池行为
 
 - 轮转选号：跳过停用、冷却中、本轮已失败的账号；

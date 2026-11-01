@@ -129,6 +129,7 @@ code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:
       <a href="#overview" data-view="overview" class="active">概览</a>
       <a href="#accounts" data-view="accounts">账号</a>
       <a href="#growth" data-view="growth">签到 · 任务</a>
+      <a href="#memory" data-view="memory">记忆</a>
       <a href="#keys" data-view="keys">密钥</a>
       <a href="#settings" data-view="settings">设置</a>
       <a href="#logs" data-view="logs">日志</a>
@@ -198,6 +199,58 @@ code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:
       <div class="panel">
         <header><h2>账号池</h2></header>
         <div class="body flush" id="accountTable"><div class="empty">还没有账号</div></div>
+      </div>
+    </section>
+
+    <!-- 记忆 -->
+    <section id="view-memory" hidden>
+      <div class="panel">
+        <header>
+          <h2>记忆目录</h2>
+          <div class="row">
+            <select id="memAccount" style="max-width:260px"></select>
+            <button class="ghost" id="memRefreshBtn">刷新</button>
+          </div>
+        </header>
+        <div class="body" id="memPins"><div class="empty">先选择账号</div></div>
+      </div>
+
+      <div class="panel">
+        <header>
+          <h2>钉一个目录</h2>
+          <span class="hint">pins 先经 memory-service 校验路径，钉成功即目录存在</span>
+        </header>
+        <div class="body">
+          <div class="row">
+            <input id="memPinPath" placeholder="/memory/notes" style="flex:1">
+            <button class="ghost" id="memPinBtn">钉住</button>
+            <button class="ghost" id="memUnpinBtn">取消</button>
+          </div>
+          <div class="hint" style="margin-top:8px">
+            列表只显示「被钉住目录」下最近三个文件的正文，不是整棵树。
+            想看到某个目录，先钉它。
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <header>
+          <h2>写入记忆（导入）</h2>
+          <span class="hint">上传文件 → /v1/memories/upload → 后台 agent 抽取后写盘</span>
+        </header>
+        <div class="body">
+          <div class="row" style="margin-bottom:10px">
+            <input id="memFileName" placeholder="note.md" style="max-width:220px">
+            <button class="primary" id="memImportBtn">导入</button>
+            <label class="hint"><input type="checkbox" id="memWait" checked style="width:auto;margin-right:6px">等它跑完</label>
+          </div>
+          <textarea id="memContent" rows="8" placeholder="# 要记住的内容&#10;&#10;写成 markdown，越具体越好"></textarea>
+          <div class="hint" style="margin-top:8px">
+            这是「导入」不是「覆写」：上游 agent 会决定落到哪个目录、怎么组织正文，
+            可能合并进已有文件。要精确改某一行，得等 DAV 写可达。
+          </div>
+          <div id="memImportResult" style="margin-top:12px"><div class="empty">尚未导入</div></div>
+        </div>
       </div>
     </section>
 
