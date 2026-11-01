@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/misakano7545/today2api-panel/internal/today"
 )
 
 // knownModels 是官方在售的常见模型，账号套餐里探到的会并进来。
@@ -32,7 +34,7 @@ func (s *Server) modelList(ctx context.Context) []string {
 		}
 		tried++
 		probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-		list, err := s.pool.ClientOf(a, cfg).Models(probeCtx)
+		list, err := s.pool.ClientOf(a, cfg).LLMModels(probeCtx)
 		cancel()
 		if err != nil {
 			continue
@@ -59,4 +61,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// planFromPricing 从套餐状态里取套餐标识（typed 版，替代早先的 map 版）。
+func planFromPricing(p *today.PricingStatus) string {
+	if p == nil {
+		return ""
+	}
+	if p.Plan.Name != "" {
+		return p.Plan.Name
+	}
+	return p.Plan.ID
 }

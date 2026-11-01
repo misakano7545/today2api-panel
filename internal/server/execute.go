@@ -51,7 +51,7 @@ func (s *Server) Start(ctx context.Context, modelID, prompt string) <-chan Event
 				}
 				continue
 			}
-			threadID, errSend := client.Send(workCtx, prompt)
+			turn, errSend := client.Send(workCtx, "", prompt)
 			if errSend != nil {
 				lastErr = errSend
 				s.pool.Report(acct.ID, errSend, modelID)
@@ -60,7 +60,7 @@ func (s *Server) Start(ctx context.Context, modelID, prompt string) <-chan Event
 			}
 
 			emitted := false
-			_, errReply := client.Reply(workCtx, threadID, func(delta string) bool {
+			_, errReply := client.Reply(workCtx, turn, func(delta string) bool {
 				emitted = true
 				select {
 				case ch <- Event{Delta: delta, Account: acct.Label, Model: modelID}:

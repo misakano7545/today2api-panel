@@ -3,21 +3,11 @@ package today
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 )
-
-func randomHex(n int) string {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		panic(err)
-	}
-	return hex.EncodeToString(buf)
-}
 
 // SendOTP 发邮箱验证码。
 //
@@ -47,13 +37,15 @@ func postAuth(ctx context.Context, hc *http.Client, bases Bases, path string, bo
 	if err != nil {
 		return err
 	}
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(bases.Auth, "/")+path, bytes.NewReader(buf))
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, trimSlash(bases.Auth)+path, bytes.NewReader(buf))
 	if errReq != nil {
 		return errReq
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Origin", strings.TrimRight(bases.App, "/"))
+	req.Header.Set("Origin", trimSlash(bases.App))
+	req.Header.Set("X-App-Version", ClientVersion)
+	req.Header.Set("X-Client-Platform", ClientPlatform)
 	if hc == nil {
 		hc = &http.Client{}
 	}

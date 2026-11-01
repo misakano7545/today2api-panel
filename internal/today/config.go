@@ -1,0 +1,164 @@
+package today
+
+import (
+	"context"
+	"encoding/json"
+	"net/url"
+	"strconv"
+	"time"
+)
+
+// ClientConfig 是 GET /v1/config 的能力协商结果。
+//
+// 客户端在发起对话前先读它：mainConversationId 决定主对话 id，
+// supportsLongPoll / longPollWaitMaxMs 决定长轮询还是短轮询。
+type ClientConfig struct {
+	MessageProtocolVersion         string `json:"messageProtocolVersion"`
+	AuthSubject                    string `json:"authSubject"`
+	MainConversationID             string `json:"mainConversationId"`
+	SupportsTypedBody              bool   `json:"supportsTypedBody"`
+	SupportsSequencePull           bool   `json:"supportsSequencePull"`
+	SupportsLongPoll               bool   `json:"supportsLongPoll"`
+	LongPollWaitMaxMs              int    `json:"longPollWaitMaxMs"`
+	SupportsAtomicCardContinuation bool   `json:"supportsAtomicCardContinuation"`
+}
+
+// configTTL 是能力协商结果的缓存时长——协议很少变，但账号切换要能生效。
+const configTTL = 10 * time.Minute
+
+// Config 读 /v1/config（带缓存）。失败时返回保守默认值，不阻塞对话。
+func (c *Client) Config(ctx context.Context) *ClientConfig {
+	c.mu.Lock()
+	if c.cfg != nil && time.Since(c.cfgAt) < configTTL {
+		cfg := *c.cfg
+		c.mu.Unlock()
+		return &cfg
+	}
+	c.mu.Unlock()
+
+	var envelope struct {
+		ClientConfig
+		Data *ClientConfig `json:"data"`
+	}
+	if err := c.getJSON(ctx, "/v1/config", nil, "config", &envelope); err != nil {
+		return &ClientConfig{MessageProtocolVersion: "canonical-v1", SupportsTypedBody: true, MainConversationID: "main"}
+	}
+	out := envelope.ClientConfig
+	if envelope.Data != nil && envelope.Data.MainConversationID != "" {
+		out = *envelope.Data
+	}
+	if out.MainConversationID == "" {
+		out.MainConversationID = "main"
+	}
+	c.mu.Lock()
+	c.cfg = &out
+	c.cfgAt = time.Now()
+	c.mu.Unlock()
+	copied := out
+	return &copied
+}
+
+// History 读一页历史消息，oldest → newest。
+func (c *Client) History(ctx context.Context, conversationID string, limit int) ([]CanonicalMessage, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	query := url.Values{}
+	query.Set("conversationId", conversationID)
+	query.Set("limit", strconv.Itoa(limit))
+	var page struct {
+		Data struct {
+			Items []CanonicalMessage `json:"items"`
+		} `json:"data"`
+	}
+	if err := c.getJSON(ctx, "/v1/conversations/messages", query, "conversations/messages", &page); err != nil {
+		return nil, err
+	}
+	return page.Data.Items, nil
+}
+
+// CanonicalMessage 是 canonical-v1 消息体，只保留网关用得上的字段。
+type CanonicalMessage struct {
+	ID                    string `json:"id"`
+	ConversationID        string `json:"conversationId"`
+	ThreadID              string `json:"threadId"`
+	Role                  string `json:"role"`
+	State                 string `json:"state"`
+	IsFinal               bool   `json:"isFinal"`
+	ClientMessageID       string `json:"clientMessageId"`
+	OriginMessageID       string `json:"originMessageId"`
+	OriginClientMessageID string `json:"originClientMessageId"`
+	CreatedAt             string `json:"createdAt"`
+	UpdatedAt             string `json:"updatedAt"`
+	Body                  struct {
+		Parts []MessagePart `json:"parts"`
+	} `json:"body"`
+}
+
+// MessagePart 是消息体的一段。正文走 messageType=text 的 content.text，
+// 流式累积段走 messageType=turn 的 content.text[]。
+type MessagePart struct {
+	MessageType string          `json:"messageType"`
+	Content     json.RawMessage `json:"content"`
+	Type        string          `json:"type"`
+	Text        string          `json:"text"`
+}
+
+// Text 把消息正文拼成纯文本。
+//
+// 卡片（qa_* / attachment / avatar_candidates）和工具调用对网关没有文本价值，跳过。
+func (m CanonicalMessage) Text() string {
+	var out []byte
+	for _, p := range m.Body.Parts {
+		switch p.MessageType {
+		case "text", "":
+			if s := partText(p.Content); s != "" {
+				out = append(out, s...)
+			} else if p.Type == "text" {
+				out = append(out, p.Text...)
+			}
+		case "turn":
+			out = append(out, turnText(p.Content)...)
+		}
+	}
+	return string(out)
+}
+
+// Done 表示这条消息不会再产生增量。
+func (m CanonicalMessage) Done() bool {
+	return m.IsFinal || m.State == "completed" || m.State == "interrupted"
+}
+
+func partText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var obj struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil && obj.Text != "" {
+		return obj.Text
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return ""
+}
+
+func turnText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var obj struct {
+		Text []string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+	var buf []byte
+	for _, s := range obj.Text {
+		buf = append(buf, s...)
+	}
+	return string(buf)
+}

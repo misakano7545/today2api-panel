@@ -1,27 +1,46 @@
 // Package today 实现 Today（todayai.cn / today.ai）的上游协议。
 //
-// 协议链：
+// 协议链（以真实客户端为准：1.24.0 静态逆向 + 上游实测）：
 //
 //	登录 Cookie（__Secure-better-auth.session_token=…）
-//	  └─ POST {app}/api/token {audience, expiresIn}
-//	       → {token, expiresIn}            ← API JWT（分钟级过期）
-//	          └─ Authorization: Bearer …   → {api}/v1/*
+//	  └─ POST {app}/api/token  {audience, expiresIn:3600}
+//	       → {token, expiresAt}          ← API JWT（小时级）
+//	          └─ Authorization: Bearer *** + X-App-Version / X-Client-Platform
+//	             → {api}/v1/*
 //
-// 对话不是 OpenAI 协议：POST /v1/messages 只回 202（用户消息已入库），
-// 回答要靠轮询 GET /v1/conversations/messages 取回并拼增量。
+// 桌面客户端另有一条 OAuth2 链（/api/auth/oauth2/token + PKCE + refresh_token），
+// 适合没有 Cookie 的场景；网关默认走 Cookie 链。
+//
+// 对话是 canonical-v1 协议：POST /v1/messages 收下
+//
+//	{body:{parts:[{id,type:"text",text}]}, clientMessageId, isMainChat:true}
+//
+// 立刻回 {canonicalMessage:{…}}（用户消息本体），助手回复靠
+// GET /v1/conversations/messages?conversationId=… 轮询增量；桌面端还能用
+// /v3/conversations/{id}/message-changes 长轮询，由 GET /v1/config 协商。
 // 上游没有 SSE，流式由网关把轮询增量伪流式下发。
 package today
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
+)
+
+// 客户端身份头。上游按这两个头做版本/平台兼容分支，缺了会掉进 legacy 分支。
+const (
+	ClientVersion  = "1.24.0"
+	ClientPlatform = "windows-client"
 )
 
 // Bases 是一个区域的上游三件套。
@@ -78,8 +97,7 @@ func asError(err error, target **Error) bool {
 			*target = e
 			return true
 		}
-		type unwrapper interface{ Unwrap() error }
-		u, ok := err.(unwrapper)
+		u, ok := err.(interface{ Unwrap() error })
 		if !ok {
 			return false
 		}
@@ -95,10 +113,13 @@ type Client struct {
 	Interval time.Duration // 轮询间隔
 	HC       *http.Client
 
-	mu     sync.Mutex
-	jwt    string
-	jwtExp time.Time
-	option string // 该账号当前生效的模型选项，避免每次请求都 PUT
+	mu       sync.Mutex
+	jwt      string
+	jwtExp   time.Time
+	option   string       // 该账号当前生效的模型选项，避免每次请求都 PUT
+	cfg      *ClientConfig // /v1/config 协商结果
+	cfgAt    time.Time
+	deviceID string
 }
 
 // NewClient 构造客户端。bases 留空的字段回落到该区域的官方地址。
@@ -114,11 +135,21 @@ func NewClient(realm, cookie string, bases Bases) *Client {
 		bases.Auth = def.Auth
 	}
 	return &Client{
-		Bases:    Bases{App: strings.TrimRight(bases.App, "/"), API: strings.TrimRight(bases.API, "/"), Auth: strings.TrimRight(bases.Auth, "/")},
+		Bases:    Bases{App: trimSlash(bases.App), API: trimSlash(bases.API), Auth: trimSlash(bases.Auth)},
 		Cookie:   cookie,
 		Interval: 250 * time.Millisecond,
 		HC:       &http.Client{Timeout: 60 * time.Second},
+		deviceID: newUUID(),
 	}
+}
+
+func trimSlash(s string) string { return strings.TrimRight(s, "/") }
+
+// DeviceID 是本次进程的稳定设备标识（对齐桌面端 X-Device-Id）。
+func (c *Client) DeviceID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deviceID
 }
 
 // Token 换出 API JWT（提前 60s 续期）。
@@ -134,48 +165,116 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 	if strings.TrimSpace(c.Cookie) == "" {
 		return "", &Error{Kind: KindAuth, Msg: "account has no cookie"}
 	}
-	body, _ := json.Marshal(map[string]any{"audience": c.API, "expiresIn": 3600})
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, c.App+"/api/token", bytes.NewReader(body))
-	if errReq != nil {
-		return "", errReq
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Origin", c.App)
-	req.Header.Set("Cookie", c.Cookie)
-	resp, errDo := c.HC.Do(req)
-	if errDo != nil {
-		return "", &Error{Kind: KindNetwork, Msg: errDo.Error()}
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-	if resp.StatusCode != http.StatusOK {
-		kind := KindServer
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			kind = KindAuth
-		}
-		return "", &Error{Kind: kind, Status: resp.StatusCode, Msg: snippet(raw)}
-	}
-	var parsed struct {
-		Token     string `json:"token"`
-		ExpiresIn int    `json:"expiresIn"`
-	}
-	if errUnmarshal := json.Unmarshal(raw, &parsed); errUnmarshal != nil || parsed.Token == "" {
-		return "", &Error{Kind: KindServer, Msg: "token response missing token: " + snippet(raw)}
-	}
-	ttl := parsed.ExpiresIn
-	if ttl <= 0 {
-		ttl = 540
+	token, exp, err := c.fetchToken(ctx)
+	if err != nil {
+		return "", err
 	}
 	c.mu.Lock()
-	c.jwt = parsed.Token
-	c.jwtExp = time.Now().Add(time.Duration(ttl) * time.Second)
+	c.jwt = token
+	c.jwtExp = exp
 	c.mu.Unlock()
-	return parsed.Token, nil
+	return token, nil
+}
+
+// fetchToken 走 web 链：POST {app}/api/token，Cookie 鉴权。
+// 上游返回 {token, expiresAt}；兼容只给 expiresIn 的老响应。
+// {auth}/api/token 兜底——部分区域只在 auth 域名暴露该路由。
+func (c *Client) fetchToken(ctx context.Context) (string, time.Time, error) {
+	body, _ := json.Marshal(map[string]any{"audience": c.API, "expiresIn": 3600})
+	var lastErr error
+	for _, endpoint := range []string{c.App + "/api/token", c.Auth + "/api/token"} {
+		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if errReq != nil {
+			return "", time.Time{}, errReq
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Accept-Language", "zh-CN")
+		req.Header.Set("Origin", c.App)
+		req.Header.Set("Cookie", c.Cookie)
+		req.Header.Set("X-App-Version", ClientVersion)
+		req.Header.Set("X-Client-Platform", ClientPlatform)
+		resp, errDo := c.HC.Do(req)
+		if errDo != nil {
+			lastErr = &Error{Kind: KindNetwork, Msg: errDo.Error()}
+			continue
+		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			lastErr = &Error{Kind: KindServer, Status: resp.StatusCode, Msg: "no token endpoint at " + endpoint}
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			kind := KindServer
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				kind = KindAuth
+			}
+			return "", time.Time{}, &Error{Kind: kind, Status: resp.StatusCode, Msg: snippet(raw)}
+		}
+		var parsed struct {
+			Token     string `json:"token"`
+			ExpiresIn int    `json:"expiresIn"`
+			ExpiresAt string `json:"expiresAt"`
+		}
+		if errUnmarshal := json.Unmarshal(raw, &parsed); errUnmarshal != nil || parsed.Token == "" {
+			return "", time.Time{}, &Error{Kind: KindServer, Msg: "token response missing token: " + snippet(raw)}
+		}
+		return parsed.Token, expiryOf(parsed.Token, parsed.ExpiresAt, parsed.ExpiresIn), nil
+	}
+	if lastErr == nil {
+		lastErr = &Error{Kind: KindServer, Msg: "no token endpoint tried"}
+	}
+	return "", time.Time{}, lastErr
+}
+
+// expiryOf 依次用 JWT exp / expiresAt / expiresIn 推断过期时刻。
+func expiryOf(token, expiresAt string, expiresIn int) time.Time {
+	if claims, ok := jwtClaims(token); ok {
+		if exp, ok := claims["exp"].(float64); ok && exp > 0 {
+			return time.Unix(int64(exp), 0)
+		}
+	}
+	if expiresAt != "" {
+		if t, err := time.Parse(time.RFC3339, expiresAt); err == nil {
+			return t
+		}
+	}
+	if expiresIn <= 0 {
+		expiresIn = 540
+	}
+	return time.Now().Add(time.Duration(expiresIn) * time.Second)
+}
+
+// jwtClaims 不验签，只读 payload——签名由上游负责，这里只取过期时间。
+func jwtClaims(token string) (map[string]any, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, false
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return nil, false
+	}
+	return claims, true
+}
+
+// apiHeaders 补齐桌面端身份头。
+func (c *Client) apiHeaders(req *http.Request) {
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "zh-CN")
+	req.Header.Set("X-App-Version", ClientVersion)
+	req.Header.Set("X-Client-Platform", ClientPlatform)
+	req.Header.Set("X-Device-Id", c.DeviceID())
+	req.Header.Set("X-Timezone", "Asia/Shanghai")
 }
 
 // do 发一个带 JWT 的 API 请求；401 时强制换票重试一次。
-func (c *Client) do(ctx context.Context, method, path string, body any) (int, []byte, error) {
+func (c *Client) do(ctx context.Context, method, path string, query url.Values, body any) (int, []byte, error) {
 	call := func() (int, []byte, error) {
 		token, errToken := c.Token(ctx)
 		if errToken != nil {
@@ -189,12 +288,17 @@ func (c *Client) do(ctx context.Context, method, path string, body any) (int, []
 			}
 			reader = bytes.NewReader(buf)
 		}
-		req, errReq := http.NewRequestWithContext(ctx, method, c.API+path, reader)
+		target := c.API + path
+		if len(query) > 0 {
+			target += "?" + query.Encode()
+		}
+		req, errReq := http.NewRequestWithContext(ctx, method, target, reader)
 		if errReq != nil {
 			return 0, nil, errReq
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Origin", c.App)
+		c.apiHeaders(req)
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
@@ -214,6 +318,51 @@ func (c *Client) do(ctx context.Context, method, path string, body any) (int, []
 	c.jwt = ""
 	c.mu.Unlock()
 	return call()
+}
+
+// getJSON 发 GET 并把 2xx 的 body 解到 out。
+func (c *Client) getJSON(ctx context.Context, path string, query url.Values, what string, out any) error {
+	status, raw, err := c.do(ctx, http.MethodGet, path, query, nil)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return classify(what, status, raw)
+	}
+	if out == nil {
+		return nil
+	}
+	if errUnmarshal := json.Unmarshal(raw, out); errUnmarshal != nil {
+		return &Error{Kind: KindServer, Msg: "decode " + what + ": " + snippet(raw)}
+	}
+	return nil
+}
+
+// postJSON 发 POST，返回原始 body 供调用方按需解码。
+func (c *Client) postJSON(ctx context.Context, path string, query url.Values, what string, body any) ([]byte, error) {
+	status, raw, err := c.do(ctx, http.MethodPost, path, query, body)
+	if err != nil {
+		return nil, err
+	}
+	switch status {
+	case http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNoContent:
+	default:
+		return nil, classify(what, status, raw)
+	}
+	return raw, nil
+}
+
+// putJSON 发 PUT。
+func (c *Client) putJSON(ctx context.Context, path string, what string, body any) (int, []byte, error) {
+	status, raw, err := c.do(ctx, http.MethodPut, path, nil, body)
+	if err != nil {
+		return status, raw, err
+	}
+	switch status {
+	case http.StatusOK, http.StatusNoContent:
+		return status, raw, nil
+	}
+	return status, raw, classify(what, status, raw)
 }
 
 // classify 把非 2xx 响应转成带归类的错误。
@@ -240,240 +389,20 @@ func snippet(raw []byte) string {
 
 // Me 拉取当前账号信息。
 func (c *Client) Me(ctx context.Context) (map[string]any, error) {
-	status, raw, err := c.do(ctx, http.MethodGet, "/v1/users/me", nil)
-	if err != nil {
-		return nil, err
-	}
-	if status != http.StatusOK {
-		return nil, classify("users/me", status, raw)
-	}
 	var out map[string]any
-	if errUnmarshal := json.Unmarshal(raw, &out); errUnmarshal != nil {
-		return nil, &Error{Kind: KindServer, Msg: "decode users/me: " + snippet(raw)}
+	if err := c.getJSON(ctx, "/v1/users/me", nil, "users/me", &out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
-// PricingStatus 返回套餐状态（含模型选项与用量）。
-func (c *Client) PricingStatus(ctx context.Context) (map[string]any, error) {
-	status, raw, err := c.do(ctx, http.MethodGet, "/v1/pricing/status", nil)
-	if err != nil {
-		return nil, err
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
 	}
-	if status != http.StatusOK {
-		return nil, classify("pricing/status", status, raw)
-	}
-	var wrapper struct {
-		Data struct {
-			Status map[string]any `json:"status"`
-		} `json:"data"`
-	}
-	if errUnmarshal := json.Unmarshal(raw, &wrapper); errUnmarshal != nil {
-		return nil, &Error{Kind: KindServer, Msg: "decode pricing/status: " + snippet(raw)}
-	}
-	return wrapper.Data.Status, nil
-}
-
-// Models 从套餐状态里读出账号可用模型 id（形如 deepseek-v4.1-flash）。
-func (c *Client) Models(ctx context.Context) ([]string, error) {
-	status, err := c.PricingStatus(ctx)
-	if err != nil {
-		return nil, err
-	}
-	options, _ := status["modelOptions"].(map[string]any)
-	if options == nil {
-		return nil, nil
-	}
-	var ids []string
-	collect := func(list []any) {
-		for _, item := range list {
-			switch v := item.(type) {
-			case string:
-				ids = append(ids, TrimOption(v))
-			case map[string]any:
-				for _, key := range []string{"optionId", "id", "value"} {
-					if s, ok := v[key].(string); ok && s != "" {
-						ids = append(ids, TrimOption(s))
-						break
-					}
-				}
-			}
-		}
-	}
-	for _, key := range []string{"availableOptions", "options", "available"} {
-		if list, ok := options[key].([]any); ok {
-			collect(list)
-		}
-	}
-	return compact(ids), nil
-}
-
-// EnsureModel 把账号的模型选项切到 optionID；已经是它就不重复 PUT。
-func (c *Client) EnsureModel(ctx context.Context, optionID string) error {
-	c.mu.Lock()
-	current := c.option
-	c.mu.Unlock()
-	if current == optionID {
-		return nil
-	}
-	status, raw, err := c.do(ctx, http.MethodPut, "/v1/pricing/model-option", map[string]any{"optionId": optionID})
-	if err != nil {
-		return err
-	}
-	// 404/405 说明该区域没有档位接口（CN 早期版本），不影响对话。
-	if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
-		return nil
-	}
-	if status != http.StatusOK && status != http.StatusNoContent {
-		return classify("pricing/model-option", status, raw)
-	}
-	c.mu.Lock()
-	c.option = optionID
-	c.mu.Unlock()
-	return nil
-}
-
-// TrimOption 去掉 "model." 前缀。
-func TrimOption(v string) string { return strings.TrimPrefix(strings.TrimSpace(v), "model.") }
-
-// OptionID 把模型 id 还原成上游的 optionId。
-func OptionID(model string) string {
-	m := strings.TrimSpace(model)
-	if strings.HasPrefix(m, "model.") {
-		return m
-	}
-	return "model." + m
-}
-
-func compact(in []string) []string {
-	seen := map[string]bool{}
-	out := in[:0]
-	for _, v := range in {
-		if v == "" || seen[v] {
-			continue
-		}
-		seen[v] = true
-		out = append(out, v)
-	}
-	return out
-}
-
-// Send 发一条用户消息，返回 threadId。
-//
-// channel=main 必填：缺了它消息不进主对话，/v1/conversations/messages?isMainChat=true
-// 永远查不到这个 thread（实测）。
-func (c *Client) Send(ctx context.Context, text string) (string, error) {
-	body := map[string]any{
-		"content":         text,
-		"messageType":     "text",
-		"clientMessageId": "msg_" + randomHex(12),
-		"channel":         "main",
-	}
-	status, raw, err := c.do(ctx, http.MethodPost, "/v1/messages", body)
-	if err != nil {
-		return "", err
-	}
-	switch status {
-	case http.StatusOK, http.StatusCreated, http.StatusAccepted:
-	default:
-		return "", classify("messages", status, raw)
-	}
-	var sent struct {
-		ThreadID string `json:"threadId"`
-	}
-	if errUnmarshal := json.Unmarshal(raw, &sent); errUnmarshal != nil || sent.ThreadID == "" {
-		return "", &Error{Kind: KindServer, Msg: "messages response missing threadId: " + snippet(raw)}
-	}
-	return sent.ThreadID, nil
-}
-
-type wireMessage struct {
-	ThreadID string `json:"threadId"`
-	Role     string `json:"role"`
-	State    string `json:"state"`
-	IsFinal  bool   `json:"isFinal"`
-	Body     struct {
-		Parts []struct {
-			MessageType string `json:"messageType"`
-			Content     struct {
-				Text string `json:"text"`
-			} `json:"content"`
-			Text string `json:"text"`
-		} `json:"parts"`
-	} `json:"body"`
-}
-
-func (m wireMessage) text() string {
-	var buf strings.Builder
-	for _, p := range m.Body.Parts {
-		if p.MessageType == "text" {
-			buf.WriteString(p.Content.Text)
-			if p.Content.Text == "" {
-				buf.WriteString(p.Text)
-			}
-		}
-	}
-	return buf.String()
-}
-
-// Reply 轮询到该 thread 的 assistant 消息完成。
-//
-// onDelta 在正文增长时被调用；返回 false 表示调用方已断开，应停止轮询。
-func (c *Client) Reply(ctx context.Context, threadID string, onDelta func(string) bool) (string, error) {
-	last := ""
-	for {
-		if err := ctx.Err(); err != nil {
-			if last != "" {
-				return last, nil
-			}
-			return "", &Error{Kind: KindNetwork, Msg: "reply timeout: " + err.Error()}
-		}
-		status, raw, err := c.do(ctx, http.MethodGet, "/v1/conversations/messages?isMainChat=true&limit=5", nil)
-		if err != nil {
-			if ctx.Err() != nil {
-				if last != "" {
-					return last, nil
-				}
-			}
-			return "", err
-		}
-		if status != http.StatusOK {
-			return "", classify("conversations/messages", status, raw)
-		}
-		var wrapper struct {
-			Data struct {
-				Items []wireMessage `json:"items"`
-			} `json:"data"`
-		}
-		if errUnmarshal := json.Unmarshal(raw, &wrapper); errUnmarshal != nil {
-			return "", &Error{Kind: KindServer, Msg: "decode conversations/messages: " + snippet(raw)}
-		}
-		for _, m := range wrapper.Data.Items {
-			if m.ThreadID != threadID || m.Role != "assistant" {
-				continue
-			}
-			text := m.text()
-			if text == "" {
-				continue
-			}
-			if len(text) > len(last) && strings.HasPrefix(text, last) {
-				if onDelta != nil && !onDelta(text[len(last):]) {
-					return text, nil
-				}
-			} else if !strings.HasPrefix(text, last) {
-				// 正文被替换（不是追加）：重新吐一遍，避免下游拼接出错。
-				if onDelta != nil && !onDelta(text) {
-					return text, nil
-				}
-			}
-			last = text
-			if m.State == "completed" || m.IsFinal {
-				return text, nil
-			}
-		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(c.Interval):
-		}
-	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }

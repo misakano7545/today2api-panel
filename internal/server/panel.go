@@ -290,8 +290,8 @@ func (s *Server) addAccount(ctx context.Context, label, realm, cookie string) (*
 			plan = p
 		}
 	}
-	if st, errStatus := client.PricingStatus(verifyCtx); errStatus == nil {
-		if p := planOf(st); p != "" {
+	if st, errStatus := client.Pricing(verifyCtx); errStatus == nil {
+		if p := planFromPricing(st); p != "" {
 			plan = p
 		}
 	}
@@ -428,9 +428,9 @@ func (s *Server) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	plan := planOf(me)
-	models, _ := client.Models(ctx)
-	if st, errStatus := client.PricingStatus(ctx); errStatus == nil {
-		if p := planOf(st); p != "" {
+	models, _ := client.LLMModels(ctx)
+	if st, errStatus := client.Pricing(ctx); errStatus == nil {
+		if p := planFromPricing(st); p != "" {
 			plan = p
 		}
 	}
