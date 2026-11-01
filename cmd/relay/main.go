@@ -29,6 +29,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -83,6 +84,7 @@ func main() {
 	verbose := flag.Bool("v", true, "打印每条转发")
 	dumpToken := flag.String("dump-token", "", "把客户端正在使用的 Bearer JWT 写到该文件（0600），用于离线复现请求")
 	cookieFile := flag.String("cookie-file", "relay-cookies.json", "签名会话 Cookie 的落盘文件，重启后仍能换票")
+	dumpReq := flag.String("dump-request", "", "把含 memor 的请求原始报文追加写到该文件（0600），排查用")
 	flag.Parse()
 
 	cert, _, err := ensureCert(*dir)
@@ -108,7 +110,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    *listen,
-		Handler: newHandler(upstreamClient, *verbose, *dumpToken, *cookieFile),
+		Handler: newHandler(upstreamClient, *verbose, *dumpToken, *cookieFile, *dumpReq),
 		TLSConfig: &tls.Config{
 			MinVersion:   tls.VersionTLS12,
 			Certificates: []tls.Certificate{*cert},
@@ -123,6 +125,7 @@ type handler struct {
 	client  *http.Client
 	verbose bool
 	mu      sync.Mutex
+	pins    pinsCache
 
 	// 登录时上游会下发签过名的会话 Cookie（<raw>.<hmac>），而桌面端手里
 	// 只有库里存的 raw token。中转层把两者的对应关系缓存下来，
@@ -138,9 +141,13 @@ type handler struct {
 	// cookieFile 存签名 Cookie 映射：中继重启后仍能把 raw token 还原成
 	// 可用的会话 Cookie，否则客户端下一次换票会 401。
 	cookieFile string
+
+	// dumpReq 非空时，把含 memor 的请求（方法/query/头/body）追加落盘。
+	// 浏览器与客户端都会在 query 里带参数，只打 Path 的日志看不出来。
+	dumpReq string
 }
 
-func newHandler(client *http.Client, verbose bool, dumpToken, cookieFile string) *handler {
+func newHandler(client *http.Client, verbose bool, dumpToken, cookieFile, dumpReq string) *handler {
 	h := &handler{
 		client:     client,
 		verbose:    verbose,
@@ -148,6 +155,7 @@ func newHandler(client *http.Client, verbose bool, dumpToken, cookieFile string)
 		lastSeen:   map[string]string{},
 		dumpToken:  dumpToken,
 		cookieFile: cookieFile,
+		dumpReq:    dumpReq,
 	}
 	h.loadCookies()
 	return h
@@ -281,6 +289,19 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 记忆页走 WebDAV（PROPFIND /memory），Next 的 rewrite 承载不了，
+	// 由只读垫层用 /v1/memories/pins 的真实数据回 207。见 memory.go。
+	if rt.Prefix != "" && (r.URL.Path == "/memory" || strings.HasPrefix(r.URL.Path, "/memory/")) {
+		h.serveMemoryDAV(w, r, rt)
+		return
+	}
+
+	// 排查用：把记忆相关路径的原始请求（含 query、全部头、body）落盘。
+	// 日志里只打 Path 会丢掉 query，排查时不够用。
+	if h.dumpReq != "" && strings.Contains(r.URL.Path, "memor") {
+		h.dumpRequest(r)
+	}
+
 	target := strings.TrimRight(rt.Upstream, "/") + rt.Prefix + r.URL.Path
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
@@ -344,7 +365,51 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		n, _ = io.Copy(w, resp.Body)
 	}
-	h.logf("%s %s%s → %s %d (%dB)", r.Method, host, r.URL.Path, target, resp.StatusCode, n)
+	h.logf("%s %s%s → %s %d (%dB)", r.Method, host, r.URL.RequestURI(), target, resp.StatusCode, n)
+}
+
+// dumpRequest 把原始请求写到 dumpReq 指定的文件，body 读完再塞回去。
+func (h *handler) dumpRequest(r *http.Request) {
+	if r.Body == nil {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n===== %s %s =====\n", r.Method, r.URL.RequestURI())
+	fmt.Fprintf(&b, "Host: %s\n", r.Host)
+	for k, vs := range r.Header {
+		for _, v := range vs {
+			if strings.EqualFold(k, "Authorization") {
+				v = "<" + fmt.Sprint(len(v)) + "B>"
+			}
+			fmt.Fprintf(&b, "%s: %s\n", k, v)
+		}
+	}
+	if len(body) > 0 {
+		if len(body) > 2048 {
+			b.WriteString("--- body (前 2048B) ---\n")
+			b.Write(body[:2048])
+		} else {
+			b.WriteString("--- body ---\n")
+			b.Write(body)
+		}
+		b.WriteString("\n")
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	f, err := os.OpenFile(h.dumpReq, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(b.String())
 }
 
 // describeCookie 只输出 Cookie 名与有效期属性，绝不输出值。
