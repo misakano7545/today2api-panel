@@ -11,7 +11,7 @@
 // 就能从被拦的网络里正常访问上游。
 //
 // relay 做三件事：
-//  1. 在本地监听 TLS（自签 CA + 覆盖四个域名的叶子证书），按 SNI 分发；
+//  1. 在本地监听 TLS（自签 CA + 覆盖两个域名的叶子证书），按 SNI 分发；
 //  2. API 域名补上 /api/cloud 前缀，Auth 域名原样转发；
 //  3. 把响应原样回给客户端（含 Set-Cookie，但去掉 Domain 属性，避免被当跨域丢弃）。
 //
@@ -67,16 +67,14 @@ type route struct {
 	App      string
 }
 
+// 只支持国内版：国际版（today.ai）已移除，不再为它做中转。
 var routes = map[string]route{
 	"api.todayai.cn":  {Upstream: "https://todayai.cn", Prefix: "/api/cloud", Audience: "https://api.todayai.cn", App: "https://todayai.cn"},
 	"auth.todayai.cn": {Upstream: "https://todayai.cn", Audience: "https://api.todayai.cn", App: "https://todayai.cn"},
-	"api.today.ai":    {Upstream: "https://today.ai", Prefix: "/api/cloud", Audience: "https://api.today.ai", App: "https://today.ai"},
-	"auth.today.ai":   {Upstream: "https://today.ai", Audience: "https://api.today.ai", App: "https://today.ai"},
 }
 
 var sans = []string{
 	"api.todayai.cn", "auth.todayai.cn",
-	"api.today.ai", "auth.today.ai",
 }
 
 func main() {

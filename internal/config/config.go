@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// Endpoints 是一个区域的上游三件套；留空则用官方默认值。
+// Endpoints 是上游三件套；留空则用官方默认值。
 //
 // Audience 是换票时请求的 JWT 受众，默认等于官方 API 域名。当 API 指向
 // 中转（例如前端同源代理 https://todayai.cn/api/cloud）时必须单独指定，
@@ -32,42 +32,28 @@ type Endpoints struct {
 // ProxyEndpoints 返回「走前端同源代理」的默认地址。
 //
 // 背景（实测）：api.todayai.cn / auth.todayai.cn 前面的 AWS ALB 会按源 IP
-// 直接回 403 + text/html，而前端站点本身（todayai.cn / today.ai）挂在别处、
-// 且带 Next.js rewrite：
+// 直接回 403 + text/html，而前端站点本身挂在别处、且带 Next.js rewrite：
 //
 //	/api/cloud/:path*  →  https://api.todayai.cn/:path*
 //
 // 这条 rewrite 是**服务端**转发，所以从被 ALB 拦掉的网络里，改走
 // {app}/api/cloud 就能正常访问上游 API。auth 同理：前端站点上也有
 // /api/auth/[...all]，{app} 可以同时当 Auth 用。
-func ProxyEndpoints(realm string) Endpoints {
-	if realm == "cn" {
-		return Endpoints{
-			App:      "https://todayai.cn",
-			Auth:     "https://todayai.cn",
-			API:      "https://todayai.cn/api/cloud",
-			Audience: "https://api.todayai.cn",
-		}
-	}
+//
+// 本项目只支持国内版（todayai.cn）；国际版（today.ai）已移除。
+func ProxyEndpoints() Endpoints {
 	return Endpoints{
-		App:      "https://today.ai",
-		Auth:     "https://today.ai",
-		API:      "https://today.ai/api/cloud",
-		Audience: "https://api.today.ai",
+		App:      "https://todayai.cn",
+		Auth:     "https://todayai.cn",
+		API:      "https://todayai.cn/api/cloud",
+		Audience: "https://api.todayai.cn",
 	}
-}
-
-// Upstream 分国内版（todayai.cn）与国际版（today.ai）。两边的 Cookie 不通用。
-type Upstream struct {
-	CN     Endpoints `json:"cn"`
-	Global Endpoints `json:"global"`
 }
 
 // Account 是一个 Today 账号。Cookie 是登录态原文，只存服务端。
 type Account struct {
 	ID     string `json:"id"`
 	Label  string `json:"label,omitempty"`
-	Realm  string `json:"realm"` // cn | global
 	Cookie string `json:"cookie"`
 	// Token 是可选的静态 API JWT：给了就直接用，不再走 Cookie 换票。
 	// 上游 JWT 只有 1 小时寿命，适合临时验证；长期请用 Cookie。
@@ -93,7 +79,7 @@ type Config struct {
 	ReplyTimeoutSec int       `json:"reply_timeout_sec"`
 	PollIntervalMs  int       `json:"poll_interval_ms"`
 	ContextTurns    int       `json:"context_turns"`
-	Upstream        Upstream  `json:"upstream"`
+	Upstream        Endpoints `json:"upstream"`
 	Checkin         Checkin   `json:"checkin"`
 	Keys            []Key     `json:"keys"`
 	Accounts        []Account `json:"accounts"`
@@ -114,12 +100,9 @@ func Defaults() Config {
 		DefaultModel:    "deepseek-v4.1-flash",
 		ReplyTimeoutSec: 240,
 		PollIntervalMs:  250,
-		Upstream: Upstream{
-			CN:     Endpoints{App: "https://todayai.cn", API: "https://api.todayai.cn", Auth: "https://auth.todayai.cn"},
-			Global: Endpoints{App: "https://today.ai", API: "https://api.today.ai", Auth: "https://auth.today.ai"},
-		},
-		Keys:     []Key{},
-		Accounts: []Account{},
+		Upstream:        ProxyEndpoints(),
+		Keys:            []Key{},
+		Accounts:        []Account{},
 	}
 }
 
@@ -148,8 +131,7 @@ func (c *Config) Normalize() {
 		dst *Endpoints
 		def Endpoints
 	}{
-		{&c.Upstream.CN, d.Upstream.CN},
-		{&c.Upstream.Global, d.Upstream.Global},
+		{&c.Upstream, d.Upstream},
 	} {
 		if pair.dst.App == "" {
 			pair.dst.App = pair.def.App
@@ -165,19 +147,6 @@ func (c *Config) Normalize() {
 			pair.dst.Audience = pair.def.API
 		}
 	}
-	for i := range c.Accounts {
-		if c.Accounts[i].Realm != "cn" {
-			c.Accounts[i].Realm = "global"
-		}
-	}
-}
-
-// EndpointsFor 返回某区域的上游地址。
-func (c *Config) EndpointsFor(realm string) Endpoints {
-	if realm == "cn" {
-		return c.Upstream.CN
-	}
-	return c.Upstream.Global
 }
 
 // NormalizeCookie 接受「整段 Cookie 头」或「只有 session 值」两种粘贴方式。

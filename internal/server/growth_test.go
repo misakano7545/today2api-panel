@@ -16,7 +16,7 @@ func TestPanelCheckinReportsActions(t *testing.T) {
 	up, mock := newMockToday(t)
 	s := newTestServer(t, up.URL, func(c *config.Config) {
 		c.Accounts = []config.Account{
-			{ID: "acc_1", Label: "main", Realm: "cn", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
+			{ID: "acc_1", Label: "main", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
 		}
 	})
 
@@ -58,8 +58,8 @@ func TestPanelCheckinAllSkipsDisabled(t *testing.T) {
 	up, _ := newMockToday(t)
 	s := newTestServer(t, up.URL, func(c *config.Config) {
 		c.Accounts = []config.Account{
-			{ID: "acc_on", Label: "on", Realm: "cn", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
-			{ID: "acc_off", Label: "off", Realm: "cn", Cookie: "__Secure-better-auth.session_token=fine", Enabled: false},
+			{ID: "acc_on", Label: "on", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
+			{ID: "acc_off", Label: "off", Cookie: "__Secure-better-auth.session_token=fine", Enabled: false},
 		}
 	})
 	rec := httptest.NewRecorder()
@@ -89,7 +89,7 @@ func TestPanelTasksList(t *testing.T) {
 	up, _ := newMockToday(t)
 	s := newTestServer(t, up.URL, func(c *config.Config) {
 		c.Accounts = []config.Account{
-			{ID: "acc_1", Label: "main", Realm: "cn", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
+			{ID: "acc_1", Label: "main", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
 		}
 	})
 	rec := httptest.NewRecorder()
@@ -123,7 +123,7 @@ func TestPanelTaskStop(t *testing.T) {
 	up, _ := newMockToday(t)
 	s := newTestServer(t, up.URL, func(c *config.Config) {
 		c.Accounts = []config.Account{
-			{ID: "acc_1", Label: "main", Realm: "cn", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
+			{ID: "acc_1", Label: "main", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
 		}
 	})
 	rec := httptest.NewRecorder()

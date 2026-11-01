@@ -1,11 +1,14 @@
 # Today2API Panel
 
-把 **Today（todayai.cn 国内版 / today.ai 国际版）** 的账号池，暴露成 **OpenAI / Codex Responses / Anthropic** 三种兼容接口的自托管网关，附内嵌 Web 管理面板。
+把 **Today 国内版（todayai.cn）** 的账号池，暴露成 **OpenAI / Codex Responses / Anthropic** 三种兼容接口的自托管网关，附内嵌 Web 管理面板。
+
+> 只支持国内版。国际版（today.ai）已移除：那边新号是 `plan:"free"`、没有对话额度
+> （发消息回 `429 quota_denied`），留着只会让配置和面板多一层无用分支。
 
 单二进制、零外部依赖（只用 Go 标准库），面板内嵌在进程里。
 
 ```
-客户端 ──Bearer sk-today-…──► 网关 ──Cookie→JWT──► api.todayai.cn / api.today.ai
+客户端 ──Bearer sk-today-…──► 网关 ──Cookie→JWT──► todayai.cn/api/cloud
                                 │
                                 ├─ 账号池（轮转 / 冷却 / 首字节前故障转移）
                                 └─ 协议翻译（三种入站 → Today 私有会话协议）
@@ -19,9 +22,10 @@ go build -o today2api ./cmd/server
 # 浏览器打开 http://127.0.0.1:8690/  → 「账号」→ 粘贴 Cookie
 ```
 
-拿 Cookie：浏览器登录 [todayai.cn](https://todayai.cn) 或 [today.ai](https://today.ai) → F12 → Application → Cookies → 复制 `__Secure-better-auth.session_token` 的值（或整段 Cookie 头）。网关会立刻用它换一次 JWT 验证，失败不会写库。
+拿 Cookie：浏览器登录 [todayai.cn](https://todayai.cn) → F12 → Application → Cookies → 复制 `__Secure-better-auth.session_token` 的值（或整段 Cookie 头）。网关会立刻用它换一次 JWT 验证，失败不会写库。
 
-国际版还支持面板里「邮箱验证码」登录；**国内版已关闭邮箱登录**（上游返回 `auth.email_sign_in_disabled`），只能用 Cookie。
+国内版的邮箱登录是关闭的（上游返回 `auth.email_sign_in_disabled`），所以面板只收 Cookie。
+如果只想临时验证，也可以在「凭证类型」里选 API JWT 直接粘贴——那种票只有 1 小时寿命。
 
 ## 客户端接入
 
@@ -134,7 +138,8 @@ POST /api/panel/checkin                 # 全账号批量签到（并发 4）
 | `context_turns` | 0 = 只发当前消息（Today 自己按会话记上下文）；N = 把最近 N 轮历史拼进正文 |
 | `checkin.enabled` | 是否后台自动签到，默认关闭 |
 | `checkin.interval_minutes` | 自动签到间隔，开启且为 0 时按 720（12 小时） |
-| `upstream.{cn,global}` | 三件套地址；留空用官方值，可指向自建中转 |
+| `upstream.{app,api,auth}` | 三件套地址；留空用官方值，可指向自建中转 |
+| `upstream.audience` | 换票时的 JWT 受众，恒为官方 API；API 走中转时也要留官方值 |
 | `keys[]` | 下游密钥（只存 sha256） |
 | `accounts[]` | 账号池（Cookie 明文，文件权限 0600） |
 
@@ -142,7 +147,7 @@ POST /api/panel/checkin                 # 全账号批量签到（并发 4）
 
 结构对照 [workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)：单二进制 + `cmd/` 入口 + `internal/{config,today,pool,server,panel}` 分层 + 内嵌单页面板 + 配置即状态。
 
-协议事实源是本机安装的两个真实客户端（`C:\Program Files\Today` 国际版、`C:\Program Files\Today CN` 国内版），
+协议事实源是本机安装的真实客户端（`C:\Program Files\Today CN` 国内版；`C:\Program Files\Today` 国际版也逆向过，记录留档但已不再支持），
 逆向过程、证据与「与仓库冲突时以客户端为准」的裁定记录见 [`docs/reverse-engineering.md`](docs/reverse-engineering.md)。
 
 历史参考（早期社区实现，部分字段与客户端不符，仅作背景）：

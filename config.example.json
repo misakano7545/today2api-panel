@@ -10,18 +10,10 @@
     "interval_minutes": 720
   },
   "upstream": {
-    "cn": {
-      "app": "https://todayai.cn",
-      "auth": "https://todayai.cn",
-      "api": "https://todayai.cn/api/cloud",
-      "audience": "https://api.todayai.cn"
-    },
-    "global": {
-      "app": "https://today.ai",
-      "auth": "https://today.ai",
-      "api": "https://today.ai/api/cloud",
-      "audience": "https://api.today.ai"
-    }
+    "app": "https://todayai.cn",
+    "auth": "https://todayai.cn",
+    "api": "https://todayai.cn/api/cloud",
+    "audience": "https://api.todayai.cn"
   },
   "keys": [],
   "accounts": []

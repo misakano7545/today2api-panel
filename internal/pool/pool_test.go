@@ -12,7 +12,7 @@ func testConfig(ids ...string) ([]config.Account, config.Config) {
 	cfg := config.Defaults()
 	var accounts []config.Account
 	for _, id := range ids {
-		accounts = append(accounts, config.Account{ID: id, Label: id, Realm: "cn", Cookie: "c=" + id, Enabled: true})
+		accounts = append(accounts, config.Account{ID: id, Label: id, Cookie: "c=" + id, Enabled: true})
 	}
 	cfg.Accounts = accounts
 	return accounts, cfg

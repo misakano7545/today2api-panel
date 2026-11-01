@@ -174,11 +174,10 @@ func mockPrompt(body map[string]any) string {
 func newTestServer(t *testing.T, upstream string, mutate func(*config.Config)) *Server {
 	t.Helper()
 	cfg := config.Defaults()
-	cfg.Upstream.CN = config.Endpoints{App: upstream, API: upstream, Auth: upstream}
-	cfg.Upstream.Global = cfg.Upstream.CN
+	cfg.Upstream = config.Endpoints{App: upstream, API: upstream, Auth: upstream, Audience: upstream}
 	cfg.PollIntervalMs = 40
 	cfg.ReplyTimeoutSec = 10
-	cfg.Accounts = []config.Account{{ID: "acc_1", Label: "a1", Realm: "cn", Cookie: "__Secure-better-auth.session_token=ok", Enabled: true}}
+	cfg.Accounts = []config.Account{{ID: "acc_1", Label: "a1", Cookie: "__Secure-better-auth.session_token=ok", Enabled: true}}
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -442,8 +441,8 @@ func TestFailoverToSecondAccount(t *testing.T) {
 	up, _ := newMockToday(t)
 	s := newTestServer(t, up.URL, func(c *config.Config) {
 		c.Accounts = []config.Account{
-			{ID: "acc_bad", Label: "bad", Realm: "cn", Cookie: "__Secure-better-auth.session_token=bad", Enabled: true},
-			{ID: "acc_ok", Label: "ok", Realm: "cn", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
+			{ID: "acc_bad", Label: "bad", Cookie: "__Secure-better-auth.session_token=bad", Enabled: true},
+			{ID: "acc_ok", Label: "ok", Cookie: "__Secure-better-auth.session_token=fine", Enabled: true},
 		}
 	})
 	key := makeKey(t, s)
@@ -468,5 +467,28 @@ func TestPanelHidesCookie(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "better-auth.session_token") {
 		t.Fatal("panel state leaked cookie")
+	}
+}
+
+// 面板视图绝不下发凭证（Cookie 与静态 JWT 都是明文 secret）。
+func TestPanelHidesCredentials(t *testing.T) {
+	up, _ := newMockToday(t)
+	s := newTestServer(t, up.URL, func(c *config.Config) {
+		c.Accounts = []config.Account{{
+			ID: "acc_1", Label: "a1", Enabled: true,
+			Cookie: "__Secure-better-auth.session_token=ok",
+			Token:  "eyJhbGciOiJIUzI1NiJ9.secretpayload.sig",
+		}}
+	})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req(http.MethodGet, "/api/panel/state", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, secret := range []string{"better-auth.session_token", "secretpayload"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("面板泄露凭证: %s", secret)
+		}
 	}
 }

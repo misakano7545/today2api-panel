@@ -179,34 +179,18 @@ code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:
       <div class="panel">
         <header><h2>添加账号</h2></header>
         <div class="body">
-          <div class="section-tabs">
-            <button class="on" data-addmode="cookie">粘贴 Cookie</button>
-            <button data-addmode="otp">邮箱验证码（仅国际版）</button>
-          </div>
           <div id="addCookie">
             <div class="grid2">
-              <label class="field"><span>区域</span>
-                <select id="addRealm"><option value="cn">国内版 todayai.cn</option><option value="global">国际版 today.ai</option></select>
-              </label>
               <label class="field"><span>备注（可空）</span><input id="addLabel" placeholder="例如：主号"></label>
+              <label class="field"><span>凭证类型</span>
+                <select id="addCredType"><option value="cookie">Cookie（长期，推荐）</option><option value="token">API JWT（1 小时，临时）</option></select>
+              </label>
             </div>
-            <label class="field"><span>Cookie</span>
-              <textarea id="addCookieText" rows="3" placeholder="__Secure-better-auth.session_token=… 或整段 Cookie 头"></textarea>
-              <span class="hint">浏览器登录 todayai.cn / today.ai → F12 → Application → Cookies → 复制 session_token。</span>
+            <label class="field"><span>Cookie / JWT</span>
+              <textarea id="addCookieText" rows="3" placeholder="__Secure-better-auth.session_token=… 或整段 Cookie 头 / 现成的 API JWT"></textarea>
+              <span class="hint">浏览器登录 todayai.cn → F12 → Application → Cookies → 复制 session_token。</span>
             </label>
             <button class="primary" id="addCookieBtn">校验并添加</button>
-          </div>
-          <div id="addOtp" hidden>
-            <div class="grid2">
-              <label class="field"><span>邮箱</span><input id="otpEmail" type="email" placeholder="you@example.com"></label>
-              <label class="field"><span>区域</span><select id="otpRealm"><option value="global">国际版 today.ai</option><option value="cn">国内版 todayai.cn</option></select></label>
-            </div>
-            <div class="row" style="margin-bottom:12px">
-              <button id="otpSendBtn">发送验证码</button>
-              <input id="otpCode" placeholder="邮件里的验证码" style="max-width:180px">
-              <button class="primary" id="otpVerifyBtn">登录并添加</button>
-            </div>
-            <p class="hint">国内版已关闭邮箱登录（上游返回 auth.email_sign_in_disabled），请用 Cookie 方式。</p>
           </div>
         </div>
       </div>

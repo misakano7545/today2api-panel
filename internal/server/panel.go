@@ -30,8 +30,6 @@ func (s *Server) panelRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/panel/accounts/{id}/check", s.panelAuth(http.HandlerFunc(s.handleAccountCheck)))
 	mux.Handle("POST /api/panel/keys", s.panelAuth(http.HandlerFunc(s.handleKeyCreate)))
 	mux.Handle("DELETE /api/panel/keys/{name}", s.panelAuth(http.HandlerFunc(s.handleKeyDelete)))
-	mux.Handle("POST /api/panel/otp/send", s.panelAuth(http.HandlerFunc(s.handleOTPSend)))
-	mux.Handle("POST /api/panel/otp/verify", s.panelAuth(http.HandlerFunc(s.handleOTPVerify)))
 	mux.Handle("POST /api/panel/probe", s.panelAuth(http.HandlerFunc(s.handleProbe)))
 	s.growthRoutes(mux)
 
@@ -123,8 +121,6 @@ type accountView struct {
 	LastUsed      string `json:"last_used,omitempty"`
 	LastModel     string `json:"last_model,omitempty"`
 }
-
-// keyView 是面板可见的密钥信息：不下发 hash。
 type keyView struct {
 	Name    string    `json:"name"`
 	Prefix  string    `json:"prefix"`
@@ -141,7 +137,9 @@ func keyViews(keys []config.Key) []keyView {
 
 // viewOf 转成面板用的账号视图，顺手抹掉 Cookie 明文。
 func viewOf(a config.Account) accountView {
+	// 凭证永不下发：Cookie 与 JWT 都是明文 secret，面板只需要知道"有没有"。
 	a.Cookie = ""
+	a.Token = ""
 	return accountView{Account: a}
 }
 
@@ -262,14 +260,14 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAccountAdd(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Label  string `json:"label"`
-		Realm  string `json:"realm"`
 		Cookie string `json:"cookie"`
+		Token  string `json:"token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
-	acct, err := s.addAccount(r.Context(), body.Label, body.Realm, body.Cookie)
+	acct, err := s.addAccount(r.Context(), body.Label, body.Cookie, body.Token)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -277,18 +275,21 @@ func (s *Server) handleAccountAdd(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": viewOf(*acct)})
 }
 
-// addAccount 校验 Cookie 真的能换到 JWT，然后落盘。
-func (s *Server) addAccount(ctx context.Context, label, realm, cookie string) (*config.Account, error) {
-	if realm != "cn" && realm != "global" {
-		realm = "global"
-	}
+// addAccount 校验凭证真的能换到 JWT，然后落盘。
+//
+// 只支持国内版（todayai.cn）。凭证二选一：
+//   - cookie：__Secure-better-auth.session_token（长期，推荐）
+//   - token：现成的 API JWT（1 小时寿命，仅临时验证）
+func (s *Server) addAccount(ctx context.Context, label, cookie, token string) (*config.Account, error) {
 	cookie = config.NormalizeCookie(cookie)
-	if cookie == "" {
-		return nil, errTextf("请粘贴 __Secure-better-auth.session_token 或整段 Cookie")
+	token = strings.TrimSpace(token)
+	if cookie == "" && token == "" {
+		return nil, errTextf("请粘贴 __Secure-better-auth.session_token 或 API JWT")
 	}
 	cfg := s.store.Snapshot()
-	ep := cfg.EndpointsFor(realm)
-	client := today.NewClient(realm, cookie, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience})
+	ep := cfg.Upstream
+	client := today.NewClient(cookie, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience})
+	client.StaticToken = token
 	client.HC = s.httpc
 	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -321,15 +322,15 @@ func (s *Server) addAccount(ctx context.Context, label, realm, cookie string) (*
 	acct := config.Account{
 		ID:      "acc_" + config.RandomHex(6),
 		Label:   label,
-		Realm:   realm,
 		Cookie:  cookie,
+		Token:   token,
 		Enabled: true,
 		AddedAt: time.Now(),
 		Plan:    plan,
 	}
 	errSave := s.store.Update(func(c *config.Config) error {
 		for _, existing := range c.Accounts {
-			if existing.Cookie == cookie {
+			if cookie != "" && existing.Cookie == cookie {
 				return errTextf("这个账号已经在池子里了")
 			}
 		}
@@ -509,70 +510,6 @@ func (s *Server) handleKeyDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-// ---------- 邮箱验证码登录 ----------
-
-func (s *Server) handleOTPSend(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Realm string `json:"realm"`
-		Email string `json:"email"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
-	if strings.TrimSpace(body.Email) == "" {
-		writeError(w, http.StatusBadRequest, "email 不能为空")
-		return
-	}
-	if body.Realm != "cn" {
-		body.Realm = "global"
-	}
-	cfg := s.store.Snapshot()
-	ep := cfg.EndpointsFor(body.Realm)
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	if err := today.SendOTP(ctx, s.httpc, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience}, body.Email); err != nil {
-		writeError(w, http.StatusBadGateway, "发送验证码失败："+err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-func (s *Server) handleOTPVerify(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Realm string `json:"realm"`
-		Email string `json:"email"`
-		Code  string `json:"code"`
-		Label string `json:"label"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
-	if body.Realm != "cn" {
-		body.Realm = "global"
-	}
-	cfg := s.store.Snapshot()
-	ep := cfg.EndpointsFor(body.Realm)
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	cookie, err := today.SignInOTP(ctx, s.httpc, today.Bases{App: ep.App, API: ep.API, Auth: ep.Auth, Audience: ep.Audience}, body.Email, body.Code)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "验证码登录失败："+err.Error())
-		return
-	}
-	label := strings.TrimSpace(body.Label)
-	if label == "" {
-		label = body.Email
-	}
-	acct, errAdd := s.addAccount(r.Context(), label, body.Realm, cookie)
-	if errAdd != nil {
-		writeError(w, http.StatusBadGateway, errAdd.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": viewOf(*acct)})
 }
 
 // ---------- 探针 ----------

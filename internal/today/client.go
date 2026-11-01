@@ -55,12 +55,9 @@ type Bases struct {
 	Audience string
 }
 
-// OfficialBases 返回官方地址。
-func OfficialBases(realm string) Bases {
-	if realm == "cn" {
-		return Bases{App: "https://todayai.cn", API: "https://api.todayai.cn", Auth: "https://auth.todayai.cn"}
-	}
-	return Bases{App: "https://today.ai", API: "https://api.today.ai", Auth: "https://auth.today.ai"}
+// OfficialBases 返回国内版官方地址（本项目只支持 todayai.cn）。
+func OfficialBases() Bases {
+	return Bases{App: "https://todayai.cn", API: "https://api.todayai.cn", Auth: "https://auth.todayai.cn"}
 }
 
 // Kind 是错误归类，决定账号池怎么冷却。
@@ -129,9 +126,9 @@ type Client struct {
 	deviceID string
 }
 
-// NewClient 构造客户端。bases 留空的字段回落到该区域的官方地址。
-func NewClient(realm, cookie string, bases Bases) *Client {
-	def := OfficialBases(realm)
+// NewClient 构造客户端。bases 留空的字段回落到官方地址。
+func NewClient(cookie string, bases Bases) *Client {
+	def := OfficialBases()
 	if bases.App == "" {
 		bases.App = def.App
 	}
@@ -408,6 +405,15 @@ func (c *Client) Me(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// randomHex 返回 n 字节的十六进制串。
+func randomHex(n int) string {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(buf)
 }
 
 func newUUID() string {

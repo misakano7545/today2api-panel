@@ -109,7 +109,7 @@ function renderAccounts(s) {
     return;
   }
   el.innerHTML = `<table><thead><tr>
-    <th>备注</th><th>区域</th><th>套餐</th><th>状态</th><th>最近使用</th><th>错误</th><th></th>
+    <th>备注</th><th>套餐</th><th>状态</th><th>最近使用</th><th>错误</th><th></th>
   </tr></thead><tbody>${s.accounts.map((a) => {
     const cooling = a.cooldown_until && new Date(a.cooldown_until) > new Date();
     const status = !a.enabled
@@ -117,7 +117,6 @@ function renderAccounts(s) {
       : cooling ? badge("冷却中", "warn") : a.fails > 0 ? badge("失败 " + a.fails, "warn") : badge("可用", "ok");
     return `<tr>
       <td>${esc(a.label)}<div class="sub mono">${esc(a.id)}</div></td>
-      <td>${a.realm === "cn" ? badge("国内", "mute") : badge("国际", "mute")}</td>
       <td class="mono">${esc(a.plan || "-")}</td>
       <td>${status}</td>
       <td class="mono">${fmtTime(a.last_used)}</td>
@@ -160,15 +159,14 @@ function renderKeys(s) {
 }
 
 function renderUpstream(s) {
-  const rows = ["cn", "global"].map((realm) => {
-    const ep = (s.config.upstream || {})[realm] || {};
-    const name = realm === "cn" ? "国内版" : "国际版";
-    return `<tr><td>${name}</td>
+  const ep = s.config.upstream || {};
+  const rows = `<tr>
       <td class="mono">${esc(ep.app || "-")}</td>
       <td class="mono">${esc(ep.api || "-")}</td>
-      <td class="mono">${esc(ep.auth || "-")}</td></tr>`;
-  }).join("");
-  $("#upstreamTable").innerHTML = `<table><thead><tr><th>区域</th><th>站点</th><th>API</th><th>认证</th></tr></thead><tbody>${rows}</tbody></table>`;
+      <td class="mono">${esc(ep.auth || "-")}</td>
+      <td class="mono">${esc(ep.audience || "-")}</td></tr>`;
+  $("#upstreamTable").innerHTML =
+    `<table><thead><tr><th>站点</th><th>API</th><th>认证</th><th>JWT 受众</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function renderSettings(s) {
@@ -189,7 +187,7 @@ function renderGrowthAccounts(s) {
   const sel = $("#growthAccount");
   const prev = state.growth.account || sel.value;
   sel.innerHTML = s.accounts.length
-    ? s.accounts.map((a) => `<option value="${esc(a.id)}">${esc(a.label)} · ${a.realm === "cn" ? "国内" : "国际"}</option>`).join("")
+    ? s.accounts.map((a) => `<option value="${esc(a.id)}">${esc(a.label)}</option>`).join("")
     : '<option value="">（无账号）</option>';
   if (prev && s.accounts.some((a) => a.id === prev)) sel.value = prev;
   state.growth.account = sel.value;
@@ -355,14 +353,6 @@ $("#logoutBtn").addEventListener("click", async () => {
   showLogin(true, "已退出登录");
 });
 
-document.querySelectorAll("[data-addmode]").forEach((btn) =>
-  btn.addEventListener("click", () => {
-    document.querySelectorAll("[data-addmode]").forEach((b) => b.classList.toggle("on", b === btn));
-    const otp = btn.dataset.addmode === "otp";
-    $("#addCookie").hidden = otp;
-    $("#addOtp").hidden = !otp;
-  }));
-
 $("#addCookieBtn").addEventListener("click", async () => {
   const btn = $("#addCookieBtn");
   btn.disabled = true;
@@ -370,7 +360,11 @@ $("#addCookieBtn").addEventListener("click", async () => {
   try {
     await api("/api/panel/accounts", {
       method: "POST",
-      body: JSON.stringify({ realm: $("#addRealm").value, label: $("#addLabel").value, cookie: $("#addCookieText").value }),
+      body: JSON.stringify({
+        label: $("#addLabel").value,
+        cookie: $("#addCredType").value === "cookie" ? $("#addCookieText").value : "",
+        token: $("#addCredType").value === "token" ? $("#addCookieText").value : "",
+      }),
     });
     $("#addCookieText").value = "";
     $("#addLabel").value = "";
@@ -381,32 +375,6 @@ $("#addCookieBtn").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
     btn.textContent = "校验并添加";
-  }
-});
-
-$("#otpSendBtn").addEventListener("click", async () => {
-  try {
-    await api("/api/panel/otp/send", {
-      method: "POST",
-      body: JSON.stringify({ realm: $("#otpRealm").value, email: $("#otpEmail").value }),
-    });
-    toast("验证码已发送", "ok");
-  } catch (err) {
-    toast(err.message, "bad");
-  }
-});
-
-$("#otpVerifyBtn").addEventListener("click", async () => {
-  try {
-    await api("/api/panel/otp/verify", {
-      method: "POST",
-      body: JSON.stringify({ realm: $("#otpRealm").value, email: $("#otpEmail").value, code: $("#otpCode").value }),
-    });
-    toast("登录并添加成功", "ok");
-    $("#otpCode").value = "";
-    await load();
-  } catch (err) {
-    toast(err.message, "bad");
   }
 });
 
