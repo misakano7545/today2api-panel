@@ -58,8 +58,18 @@ type Config struct {
 	PollIntervalMs  int       `json:"poll_interval_ms"`
 	ContextTurns    int       `json:"context_turns"`
 	Upstream        Upstream  `json:"upstream"`
+	Checkin         Checkin   `json:"checkin"`
 	Keys            []Key     `json:"keys"`
 	Accounts        []Account `json:"accounts"`
+}
+
+// Checkin 是后台自动签到的配置。
+//
+// Today 的签到 = 读 /v1/rapport + 上报两条客户端可申报动作，
+// 两条动作上游都是幂等的，所以重复跑不会重复计分。
+type Checkin struct {
+	Enabled         bool `json:"enabled"`
+	IntervalMinutes int  `json:"interval_minutes"`
 }
 
 func Defaults() Config {
@@ -79,6 +89,12 @@ func Defaults() Config {
 
 // Normalize 补齐缺省值并修正非法取值；在加载与每次保存前都会跑一遍。
 func (c *Config) Normalize() {
+	if c.Checkin.Enabled && c.Checkin.IntervalMinutes <= 0 {
+		c.Checkin.IntervalMinutes = 720
+	}
+	if c.Checkin.IntervalMinutes < 0 {
+		c.Checkin.IntervalMinutes = 0
+	}
 	d := Defaults()
 	if strings.TrimSpace(c.Listen) == "" {
 		c.Listen = d.Listen

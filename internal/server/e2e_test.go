@@ -23,6 +23,8 @@ type mockToday struct {
 	prompt          string
 	sent            []map[string]any
 	clientMessageID string
+	rapportReads    int
+	reported        []string
 }
 
 func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
@@ -49,6 +51,43 @@ func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
 			_, _ = w.Write([]byte(`{"data":{"status":{"plan":{"id":"pro"},"modelOptions":{"selectedOptionId":"model.deepseek-v4.1-flash","availableOptions":[{"optionId":"model.deepseek-v4.1-flash"},{"optionId":"model.glm-5.3"}]}}}}`))
 		case r.URL.Path == "/v1/llm/models":
 			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"deepseek-v4.1-flash"}]}}`))
+		case r.URL.Path == "/v1/rapport" && r.Method == http.MethodGet:
+			// 第一次读（签到前）与第二次读（签到后）分数不同，用来验证 delta。
+			m.mu.Lock()
+			m.rapportReads++
+			points := 40
+			if m.rapportReads > 1 {
+				points = 90
+			}
+			m.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"points": points, "levelKey": "l2", "level": 2,
+				"levels": []any{map[string]any{"key": "l1", "name": "初见", "points": 0}},
+				"rules": []any{
+					map[string]any{"key": "notification-enabled", "title": "开启通知", "points": 25, "status": "completed"},
+					map[string]any{"key": "discord-joined", "title": "加入 Discord", "points": 25, "status": "completed"},
+					map[string]any{"key": "daily-chat", "title": "每日对话", "points": 10, "status": "pending"},
+				},
+			}})
+		case strings.HasPrefix(r.URL.Path, "/v1/rapport/actions/") && r.Method == http.MethodPost:
+			if r.Header.Get("Authorization") != "Bearer jwt-test" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			m.mu.Lock()
+			m.reported = append(m.reported, strings.TrimPrefix(r.URL.Path, "/v1/rapport/actions/"))
+			m.mu.Unlock()
+			_, _ = w.Write([]byte(`{"data":{"ok":true}}`))
+		case r.URL.Path == "/v1/tasks":
+			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"task-1","type":"research","title":"整理周报","status":"running","createdAt":"2026-11-01T00:00:00Z"}]}}`))
+		case r.URL.Path == "/v1/tasks/summary":
+			_, _ = w.Write([]byte(`{"data":{"running":1,"completed":3}}`))
+		case r.URL.Path == "/v1/tasks/templates/types":
+			_, _ = w.Write([]byte(`{"data":{"types":["research","writing"]}}`))
+		case r.URL.Path == "/v1/tasks/recommendations":
+			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"rec-1","title":"试试周报助手"}]}}`))
+		case r.URL.Path == "/v1/tasks/task-1/stop" && r.Method == http.MethodPost:
+			_, _ = w.Write([]byte(`{"data":{"ok":true}}`))
 		case r.URL.Path == "/v1/pricing/model-option" && r.Method == http.MethodPut:
 			if r.Header.Get("Authorization") != "Bearer jwt-test" {
 				w.WriteHeader(http.StatusUnauthorized)

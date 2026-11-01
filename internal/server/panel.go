@@ -33,6 +33,7 @@ func (s *Server) panelRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/panel/otp/send", s.panelAuth(http.HandlerFunc(s.handleOTPSend)))
 	mux.Handle("POST /api/panel/otp/verify", s.panelAuth(http.HandlerFunc(s.handleOTPVerify)))
 	mux.Handle("POST /api/panel/probe", s.panelAuth(http.HandlerFunc(s.handleProbe)))
+	s.growthRoutes(mux)
 
 	mux.Handle("GET /", panel.Handler())
 }
