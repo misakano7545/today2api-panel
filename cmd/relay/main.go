@@ -37,6 +37,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
@@ -386,15 +387,24 @@ func (h *handler) shimWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 	accept := base64.StdEncoding.EncodeToString(sum[:])
-	if _, err := fmt.Fprintf(brw,
-		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
-		accept); err != nil {
+	resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + accept + "\r\n"
+	// 客户端若带了子协议，服务端必须回显其中一个，否则 undici 会判定握手失败
+	// （表现为“socket never opened”，然后无限重连）。
+	if proto := r.Header.Get("Sec-WebSocket-Protocol"); proto != "" {
+		first := strings.TrimSpace(strings.Split(proto, ",")[0])
+		if first != "" {
+			resp += "Sec-WebSocket-Protocol: " + first + "\r\n"
+		}
+	}
+	resp += "\r\n"
+	if _, err := brw.WriteString(resp); err != nil {
 		return
 	}
 	if err := brw.Flush(); err != nil {
 		return
 	}
-	h.logf("WS  %s%s → 本地 shim 已接入（真实通道不可达）", r.Host, r.URL.Path)
+	h.logf("WS  %s%s → 本地 shim 已接入（proto=%q ext=%q）", r.Host, r.URL.Path, r.Header.Get("Sec-WebSocket-Protocol"), r.Header.Get("Sec-WebSocket-Extensions"))
 
 	for {
 		op, payload, err := readWSFrame(brw.Reader)
@@ -409,10 +419,88 @@ func (h *handler) shimWebSocket(w http.ResponseWriter, r *http.Request) {
 		case 0x9: // ping → pong
 			_ = writeWSFrame(brw.Writer, 0xA, payload)
 			_ = brw.Flush()
-		case 0x1, 0x2: // text / binary：shim 不回业务，静默吞掉
+		case 0x1, 0x2: // text / binary
+			if h.verbose {
+				h.logf("WS  ← %s", truncateForLog(payload, 300))
+			}
+			h.replyHandshake(brw.Writer, payload)
 			continue
 		}
 	}
+}
+
+// replyHandshake 按客户端的 cloud websocket 协议回应握手帧。
+//
+// 客户端（packages/socket/src/classic）状态机：
+//
+//	device.hello  → 等 cloud.hello_ack（必须带 messageProtocolVersion，
+//	                否则判协议不兼容并主动断开）
+//	device.resume → 等 cloud.resume_ok（带 replayedCount）
+//
+// 不回的话客户端在 SETUP/握手看门狗超时后重连，界面上就是一直"连接中"。
+func (h *handler) replyHandshake(w *bufio.Writer, frame []byte) {
+	var msg struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(frame, &msg); err != nil {
+		return
+	}
+	var out map[string]any
+	switch msg.Type {
+	case "device.hello":
+		out = map[string]any{
+			"id":                     newFrameID(),
+			"timestamp":              time.Now().UTC().Format(time.RFC3339Nano),
+			"type":                   "cloud.hello_ack",
+			"messageProtocolVersion": "canonical-v1",
+			"sessionId":              "relay-" + newFrameID(),
+			"heartbeatIntervalMs":    30000,
+			"replayedCount":          0,
+		}
+	case "device.resume":
+		out = map[string]any{
+			"id":                     newFrameID(),
+			"timestamp":              time.Now().UTC().Format(time.RFC3339Nano),
+			"type":                   "cloud.resume_ok",
+			"messageProtocolVersion": "canonical-v1",
+			"sessionId":              "relay-" + newFrameID(),
+			"heartbeatIntervalMs":    30000,
+			"replayedCount":          0,
+		}
+	default:
+		return
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		return
+	}
+	if err := writeWSFrame(w, 0x1, body); err != nil {
+		return
+	}
+	_ = w.Flush()
+	h.logf("WS  → %s", string(body))
+}
+
+// newFrameID 生成握手帧 id（客户端只要求有 id）。
+func newFrameID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "00000000-0000-4000-8000-000000000000"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// truncateForLog 截断帧内容，避免日志被大帧淹没。
+func truncateForLog(b []byte, n int) string {
+	s := string(b)
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 // readWSFrame 读一个（被客户端掩码过的）WebSocket 帧。
