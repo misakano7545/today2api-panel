@@ -553,3 +553,142 @@ POST /api/panel/accounts/{id}/check
 
 > ⚠️ 结论：**不要就地改安装目录**。客户端要能登录，需要给它一条干净出口
 > （换网络 / 代理 / 手机热点），或者用下节的网关方案，不改客户端。
+
+---
+
+## 8. 国内版动态抓包实录（2026-11-01，真实 pro 账号）
+
+本节全部是**真实请求的真实响应**，用客户端自己的 JWT 直接打
+`https://todayai.cn/api/cloud`（同源代理通道），不是推测。
+
+### 8.1 账号与套餐
+
+```json
+GET /v1/pricing/status →
+{"success":true,"code":"common.ok","data":{"status":{
+  "schemaVersion":1,"plan":"pro","subscriptionState":"none",
+  "accessPhase":"normal","accessSource":"manual_internal",
+  "serviceState":"normal","currentPeriodEndAt":"2026-12-01T…",
+  "modelOptions":{"selectedOptionId":"mode.balanced",
+    "options":[{"id":"mode.balanced","disabled":false},…]}}}}
+```
+
+对照：国际版同账号体系下的新号是 `plan:"free"`、`accessPhase:"none"`，
+发消息直接 `429 {"error":"quota_denied"}` —— **免费版没有对话额度**，
+这也解释了「国际版必须付费」的观感。
+
+### 8.2 发消息：202 + 两种形状并存
+
+```json
+POST /v1/messages  →  HTTP 202
+{"threadId":"01a19522-ce0e-7115-8572-f1406b3ce073",
+ "messageId":"01a19522-ce0e-7990-af2b-477684670f13",
+ "clientMessageId":"61b38a56-…","createdAt":"2026-11-01T03:24:08.590926554Z",
+ "isDuplicate":false,
+ "canonicalMessage":{"id":"01a19522-ce0e-7990-…","conversationId":"QqwMtr…",
+   "threadId":"01a19522-ce0e-7115-…","cursor":"eyJ2Ij…","role":"user",
+   "state":"completed","isFinal":true,"clientMessageId":"61b38a56-…",
+   "originClientMessageId":"61b38a56-…","originTriggerType":"asst_response",
+   "createdAt":"…","updatedAt":"…",
+   "body":{"parts":[{"messageType":"text","content":{"text":"用一句话回答：1+1 等于几？"}}]}}}
+```
+
+要点：
+
+- **状态码是 202**，不是 200；
+- 顶层 `threadId` / `messageId` / `clientMessageId` / `isDuplicate` 与
+  `canonicalMessage` **同时存在**。仓库第一版只取 `{threadId,messageId}`，
+  我改成只认 `canonicalMessage` —— 两边都只对一半，现在两个都读；
+- 用户消息的 `originTriggerType` 就是 `asst_response`，表示这条会触发助手回复。
+
+### 8.3 取回答：历史页按 originClientMessageId 归属
+
+```json
+GET /v1/conversations/messages?conversationId=<主对话>&limit=6 →
+{"success":true,"code":"common.ok","data":{"items":[…],
+  "paging":{"nextCursor":null,"hasMore":false}}}
+```
+
+助手消息终态：
+
+```json
+{"id":"msg_aw_54ad9806…","conversationId":"QqwMtr…","threadId":"01a19522-ce0e-7115-…",
+ "cursor":"eyJ2Ij…","role":"assistant","state":"completed","isFinal":true,
+ "originClientMessageId":"61b38a56-…",     ← 归属：等于发消息时的 clientMessageId
+ "originMessageId":"01a19522-ce0e-7990-…", ← 对应那条用户消息的 id
+ "originTriggerType":"asst_response",
+ "createdAt":"2026-11-01T03:24:11.292512Z","updatedAt":"…",
+ "body":{"parts":[{"messageType":"text","content":{"text":"1+1 等于 2。"}}]}}
+```
+
+### 8.4 流式的真相：历史页只给终态
+
+用 200ms 频率连轮询同一条回复，全程只观察到 **一种形态**：
+
+```
+state=completed  final=True  parts=[text]  len=50   :: '1\n2\n…\n20'
+```
+
+也就是说：**`GET /v1/conversations/messages` 不暴露中间增量**，
+只有写完才出现。客户端 UI 之所以能逐字输出，是因为它走 socket
+（`chat.message_ready.v2` / `message_updated.v2`）或长轮询
+（`/v3/conversations/{id}/message-changes`，需要额外参数，直接 GET 是
+`400 common.invalid_request`）。
+
+对网关的含义：**没有 socket 就只能"等写完一次性吐"**。
+`internal/server/execute.go` 的伪流式在这种情况下会表现为「首字慢、然后整段到达」。
+想真正做到逐字，必须接 socket 或长轮询。
+
+### 8.5 签到：确认没有客户端可触发的每日签到
+
+`GET /v1/rapport`（国内版 pro）：
+
+```json
+{"success":true,"data":{"rapport":{"currentPoints":0,"nextLevelPoints":100,
+  "progress":0,"isMaxLevel":false,
+  "currentLevel":{"key":"origin","points":0,"name":"Origin","description":"…"}},
+ "levels":[{"key":"origin","points":0},…{"key":"together","points":1500}],
+ "rules":[{"key":"memory_update","points":2,"status":"available",
+           "scoreTrigger":"server_event","note":"Up to 3 times per day · 6 points/day max",
+           "action":{"type":"deeplink","url":"today://memories"}}, …]}}
+```
+
+所有规则的 `scoreTrigger` 都是 `server_event` —— 积分由服务端事件累计
+（发消息、建任务、连设备），客户端**点不动**。
+
+客户端仅有的两条"可申报动作"实测幂等，一次性：
+
+```
+POST /v1/rapport/actions/notification-enabled → 200 {"data":{"rule":{"key":"notification_enabled","status":"completed"}}}
+POST /v1/rapport/actions/discord-joined       → 200 {"data":{"rule":{"key":"discord_join_reported","status":"completed"}}}
+POST /v1/rapport/actions/daily-checkin        → 404
+```
+
+结论：**上游没有 daily-checkin 这种端点**。网关里的"签到"= 读快照 + 上报这两条
++ 对比积分差，别指望每天点一下能拿分。
+
+### 8.6 任务 / 日记 / 未读
+
+```
+GET  /v1/tasks                      → {"object":"list","data":[],"nextCursor":null,"hasMore":false}
+GET  /v1/tasks/summary              → 400 "Either scope or from is required"
+GET  /v1/tasks/recommendations      → {"object":"list","batchId":null,"data":[],"total":0}
+GET  /v1/tasks/templates/types      → {"data":{"items":[{"type":"general","typeName":"General"},…]}}
+GET  /v1/diaries?limit=3            → {"object":"list","data":[],…,"total":0}
+GET  /v1/conversations/unread-status→ 400 common.invalid_request（要参数）
+GET  /v3/conversations/{id}/messages→ 200（另一套历史分页）
+```
+
+### 8.7 客户端登录链路（国内版，实测时间线）
+
+```
+11:20:15  POST auth.todayai.cn/api/auth/phone-number/verify                200
+11:20:15  GET  auth.todayai.cn/api/auth/token                              200   ← 中继合成
+11:20:15  GET  auth.todayai.cn/api/auth/get-session                        200
+11:20:16  GET  api.todayai.cn/v1/users/me                                  200
+11:20:16  POST api.todayai.cn/registry/devices                             201
+11:20:16  GET  api.todayai.cn/ws            (WebSocket upgrade)            101
+```
+
+国际版同链路只有邮箱 OTP（`email-otp/send-verification-otp` → `sign-in/email-otp`），
+且新号 `plan:"free"` 无对话额度。

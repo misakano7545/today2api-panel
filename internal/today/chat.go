@@ -10,6 +10,7 @@ import (
 // Turn 是一次用户消息的凭据：拿它去轮询对应的助手回复。
 type Turn struct {
 	ConversationID  string
+	ThreadID        string
 	ClientMessageID string
 	UserMessageID   string
 	SentAt          time.Time
@@ -24,6 +25,21 @@ type Turn struct {
 //
 // 主对话用 isMainChat:true（不带 conversationId）；指定会话时用
 // isMainChat:false + conversationId。
+//
+// 实测响应（国内版 pro 账号，2026-11）：
+//
+//	HTTP 202
+//	{"threadId":"01a19522-ce0e-7115-8572-f1406b3ce073",
+//	 "messageId":"01a19522-ce0e-7990-af2b-477684670f13",
+//	 "clientMessageId":"…","createdAt":"…","isDuplicate":false,
+//	 "canonicalMessage":{"id":"…","conversationId":"…","threadId":"…",
+//	   "cursor":"…","role":"user","state":"completed","isFinal":true,
+//	   "clientMessageId":"…","originClientMessageId":"…",
+//	   "originTriggerType":"asst_response","body":{"parts":[…]}}}
+//
+// 即：顶层的 threadId / messageId 与 canonicalMessage 同时存在——
+// 早期仓库只取 {threadId,messageId} 是对的，后来又只认 canonicalMessage
+// 也不完整，两者都要。
 func (c *Client) Send(ctx context.Context, conversationID, text string) (*Turn, error) {
 	if conversationID == "" {
 		conversationID = c.Config(ctx).MessageCapabilities.MainConversationID
@@ -55,23 +71,35 @@ func (c *Client) Send(ctx context.Context, conversationID, text string) (*Turn, 
 	}
 	turn := &Turn{ConversationID: conversationID, ClientMessageID: clientMessageID, SentAt: time.Now()}
 
-	// 响应有两种形状：{canonicalMessage:{…}}，或信封 {data:{canonicalMessage:{…}}}。
 	var reply struct {
+		ThreadID    string `json:"threadId"`
+		MessageID   string `json:"messageId"`
+		IsDuplicate bool   `json:"isDuplicate"`
+		// 老形状：{canonicalMessage:{…}}
 		CanonicalMessage *CanonicalMessage `json:"canonicalMessage"`
-		Data             *struct {
+		// 信封形状：{data:{canonicalMessage:{…}}}
+		Data *struct {
 			CanonicalMessage *CanonicalMessage `json:"canonicalMessage"`
 		} `json:"data"`
 	}
 	if errUnmarshal := json.Unmarshal(raw, &reply); errUnmarshal == nil {
+		if reply.ThreadID != "" {
+			turn.ThreadID = reply.ThreadID
+		}
 		msg := reply.CanonicalMessage
 		if msg == nil && reply.Data != nil {
 			msg = reply.Data.CanonicalMessage
 		}
 		if msg != nil {
 			turn.UserMessageID = msg.ID
+			if msg.ThreadID != "" {
+				turn.ThreadID = msg.ThreadID
+			}
 			if msg.ConversationID != "" && msg.ConversationID != "main" {
 				turn.ConversationID = msg.ConversationID
 			}
+		} else if reply.MessageID != "" {
+			turn.UserMessageID = reply.MessageID
 		}
 	}
 	return turn, nil
