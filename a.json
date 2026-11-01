@@ -1,1 +1,0 @@
-{"content":[{"text":"你这条消息在我这边显示成了乱码，我按编码还原了一下，应该是「回复我名字，收到」，上一条同类的则是「用一句话说，我是谁」。\n\n那照做：MisakaNo，收到。","type":"text"}],"id":"msg_40f270ea9f70b5b370bffd34","model":"deepseek-v4.1-flash","role":"assistant","stop_reason":"end_turn","stop_sequence":null,"type":"message","usage":{"input_tokens":7,"output_tokens":40}}
