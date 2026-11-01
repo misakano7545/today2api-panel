@@ -8,15 +8,32 @@ import (
 	"time"
 )
 
-// ClientConfig 是 GET /v1/config 的能力协商结果。
+// ClientConfig 是 GET /v1/config 的响应。
 //
-// 客户端在发起对话前先读它：mainConversationId 决定主对话 id，
-// supportsLongPoll / longPollWaitMaxMs 决定长轮询还是短轮询。
+// 实测形状（2026-11，国际版 free 账号）：
+//
+//	{"defaultAvatars":[…],"characters":[…],…
+//	 "messageCapabilities":{"messageProtocolVersion":"canonical-v1",
+//	   "authSubject":"…","mainConversationId":"…","supportsTypedBody":true,
+//	   "messageReactionsVersion":"v1","supportsSequencePull":true,
+//	   "supportsLongPoll":true,"longPollWaitMaxMs":25000,
+//	   "supportsAtomicCardContinuation":false},
+//	 "fileCapabilities":{…}}
+//
+// 注意：这是**站点公开配置**（头像 / 角色 / 输入框占位符都在里面），
+// mainConversationId 嵌在 messageCapabilities 里，不在顶层。
 type ClientConfig struct {
+	MessageCapabilities MessageCapabilities `json:"messageCapabilities"`
+	FileCapabilities    map[string]any      `json:"fileCapabilities"`
+}
+
+// MessageCapabilities 是 canonical-v1 的能力协商段。
+type MessageCapabilities struct {
 	MessageProtocolVersion         string `json:"messageProtocolVersion"`
 	AuthSubject                    string `json:"authSubject"`
 	MainConversationID             string `json:"mainConversationId"`
 	SupportsTypedBody              bool   `json:"supportsTypedBody"`
+	MessageReactionsVersion        string `json:"messageReactionsVersion"`
 	SupportsSequencePull           bool   `json:"supportsSequencePull"`
 	SupportsLongPoll               bool   `json:"supportsLongPoll"`
 	LongPollWaitMaxMs              int    `json:"longPollWaitMaxMs"`
@@ -36,19 +53,16 @@ func (c *Client) Config(ctx context.Context) *ClientConfig {
 	}
 	c.mu.Unlock()
 
-	var envelope struct {
-		ClientConfig
-		Data *ClientConfig `json:"data"`
+	var out ClientConfig
+	if err := c.getJSON(ctx, "/v1/config", nil, "config", &out); err != nil {
+		return &ClientConfig{MessageCapabilities: MessageCapabilities{
+			MessageProtocolVersion: "canonical-v1",
+			MainConversationID:     "main",
+			SupportsTypedBody:      true,
+		}}
 	}
-	if err := c.getJSON(ctx, "/v1/config", nil, "config", &envelope); err != nil {
-		return &ClientConfig{MessageProtocolVersion: "canonical-v1", SupportsTypedBody: true, MainConversationID: "main"}
-	}
-	out := envelope.ClientConfig
-	if envelope.Data != nil && envelope.Data.MainConversationID != "" {
-		out = *envelope.Data
-	}
-	if out.MainConversationID == "" {
-		out.MainConversationID = "main"
+	if out.MessageCapabilities.MainConversationID == "" {
+		out.MessageCapabilities.MainConversationID = "main"
 	}
 	c.mu.Lock()
 	c.cfg = &out

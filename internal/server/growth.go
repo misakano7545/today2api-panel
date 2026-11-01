@@ -165,7 +165,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	summary, _ := client.TaskSummary(ctx)
+	summary, _ := client.TaskSummary(ctx, nil)
 	templates, _ := client.TaskTemplates(ctx)
 	recs, _ := client.TaskRecommendations(ctx)
 	writeJSON(w, http.StatusOK, map[string]any{

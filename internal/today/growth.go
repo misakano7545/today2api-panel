@@ -4,35 +4,63 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 )
 
-// Rapport 是 GET /v1/rapport 的结构（客户端 agentProfile 页读它）。
+// Rapport 是 GET /v1/rapport 的 data 段。
 //
-// 上游把它称作“亲密度/连接度”：points 是当前积分，levels 是等级轨道，
-// rules 是一张张可完成项（status=completed 表示已记入）。
+// 实测（2026-11，国际版 free 账号）：
+//
+//	{"success":true,"code":"common.ok","message":"OK","data":{
+//	  "rapport":{"currentPoints":20,"nextLevelPoints":100,"progress":0.2,
+//	             "isMaxLevel":false,
+//	             "currentLevel":{"key":"origin","points":0,"name":"Origin","description":"…"},
+//	             "updatedAt":"2026-11-01T02:24:46.232Z"},
+//	  "levels":[{"key":"origin","points":0,"name":"Origin","description":"…"}, …],
+//	  "rules":[{"key":"memory_update","title":"Memory Update","description":"…",
+//	            "note":"Up to 3 times per day · 6 points/day max","points":2,
+//	            "status":"available","scoreTrigger":"server_event",
+//	            "action":{"type":"deeplink","url":"today://memories"}}, …]}}
+//
+// 关键：规则是 **server_event** 驱动（status=available/completed），
+// 客户端点不动；能主动申报的只有 actions/ 下那两条。
 type Rapport struct {
-	Points   int            `json:"points"`
-	LevelKey string         `json:"levelKey"`
-	Level    int            `json:"level"`
-	Levels   []RapportLevel `json:"levels"`
-	Rules    []RapportRule  `json:"rules"`
+	Rapport RapportSummary `json:"rapport"`
+	Levels  []RapportLevel `json:"levels"`
+	Rules   []RapportRule  `json:"rules"`
+}
+
+// RapportSummary 是当前积分与等级。
+type RapportSummary struct {
+	CurrentPoints   int          `json:"currentPoints"`
+	NextLevelPoints int          `json:"nextLevelPoints"`
+	Progress        float64      `json:"progress"`
+	IsMaxLevel      bool         `json:"isMaxLevel"`
+	CurrentLevel    RapportLevel `json:"currentLevel"`
+	UpdatedAt       string       `json:"updatedAt"`
 }
 
 // RapportLevel 是等级轨道里的一档。
 type RapportLevel struct {
-	Key    string `json:"key"`
-	Name   string `json:"name"`
-	Points int    `json:"points"`
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	Points      int    `json:"points"`
+	Description string `json:"description"`
 }
 
-// RapportRule 是一条可完成项。Points 是奖励分，Note 是上限说明。
+// RapportRule 是一条可完成项。Status 取值 available / completed。
 type RapportRule struct {
-	Key         string `json:"key"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Note        string `json:"note"`
-	Points      int    `json:"points"`
-	Status      string `json:"status"`
+	Key          string `json:"key"`
+	Title        string `json:"title"`
+	Description  string `json:"description"`
+	Note         string `json:"note"`
+	Points       int    `json:"points"`
+	Status       string `json:"status"`
+	ScoreTrigger string `json:"scoreTrigger"`
+	Action       struct {
+		Type string `json:"type"`
+		URL  string `json:"url"`
+	} `json:"action"`
 }
 
 // Done 表示这条规则已经入账。
@@ -51,6 +79,8 @@ func ClientReportActions() []string {
 }
 
 // Rapport 读亲密度快照（积分 + 等级 + 规则）。
+//
+// 响应是信封 {success,code,message,data:{rapport,levels,rules}}。
 func (c *Client) Rapport(ctx context.Context) (*Rapport, error) {
 	var envelope struct {
 		Data Rapport `json:"data"`
@@ -58,15 +88,7 @@ func (c *Client) Rapport(ctx context.Context) (*Rapport, error) {
 	if err := c.getJSON(ctx, "/v1/rapport", nil, "rapport", &envelope); err != nil {
 		return nil, err
 	}
-	out := envelope.Data
-	if out.Points == 0 && out.LevelKey == "" && len(out.Rules) == 0 {
-		// 少数响应不带 data 信封，直接平铺。
-		var flat Rapport
-		if err := c.getJSON(ctx, "/v1/rapport", nil, "rapport", &flat); err == nil {
-			return &flat, nil
-		}
-	}
-	return &out, nil
+	return &envelope.Data, nil
 }
 
 // ReportRapportAction 上报一条客户端可申报的动作（幂等）。
@@ -77,12 +99,12 @@ func (c *Client) ReportRapportAction(ctx context.Context, action string) error {
 
 // CheckInResult 是一次签到的结果快照。
 type CheckInResult struct {
-	Before   *Rapport       `json:"before"`
-	After    *Rapport       `json:"after"`
-	Delta    int            `json:"delta"`
-	Reported []string       `json:"reported"`
+	Before   *Rapport          `json:"before"`
+	After    *Rapport          `json:"after"`
+	Delta    int               `json:"delta"`
+	Reported []string          `json:"reported"`
 	Failed   map[string]string `json:"failed,omitempty"`
-	Claimed  []string       `json:"claimed"`
+	Claimed  []string          `json:"claimed"`
 }
 
 // CheckIn 执行一次“签到”。
@@ -111,7 +133,7 @@ func (c *Client) CheckIn(ctx context.Context) (*CheckInResult, error) {
 		return res, nil
 	}
 	res.After = after
-	res.Delta = after.Points - before.Points
+	res.Delta = after.Rapport.CurrentPoints - before.Rapport.CurrentPoints
 	for _, rule := range after.Rules {
 		if rule.Done() {
 			res.Claimed = append(res.Claimed, rule.Key)
@@ -131,58 +153,72 @@ type Task struct {
 	Raw       map[string]any `json:"-"`
 }
 
-// Tasks 列任务（GET /v1/tasks）。
+// Tasks 列任务。
+//
+// 实测响应：{"object":"list","data":[],"nextCursor":null,"hasMore":false}
 func (c *Client) Tasks(ctx context.Context) ([]Task, error) {
 	var envelope struct {
-		Data struct {
-			Items []map[string]any `json:"items"`
-		} `json:"data"`
+		Data []map[string]any `json:"data"`
 	}
 	if err := c.getJSON(ctx, "/v1/tasks", nil, "tasks", &envelope); err != nil {
 		return nil, err
 	}
-	out := make([]Task, 0, len(envelope.Data.Items))
-	for _, item := range envelope.Data.Items {
+	out := make([]Task, 0, len(envelope.Data))
+	for _, item := range envelope.Data {
 		out = append(out, toTask(item))
 	}
 	return out, nil
 }
 
-// TaskSummary 读任务汇总（GET /v1/tasks/summary），原样返回。
-func (c *Client) TaskSummary(ctx context.Context) (map[string]any, error) {
+// TaskSummary 读任务汇总。
+//
+// 上游要求 scope 或 from 参数（缺了回 400 "Either scope or from is required"），
+// 这里交给调用方传 query。
+func (c *Client) TaskSummary(ctx context.Context, query url.Values) (map[string]any, error) {
+	if len(query) == 0 {
+		return map[string]any{}, nil
+	}
 	var envelope struct {
 		Data map[string]any `json:"data"`
 	}
-	if err := c.getJSON(ctx, "/v1/tasks/summary", nil, "tasks/summary", &envelope); err != nil {
+	if err := c.getJSON(ctx, "/v1/tasks/summary", query, "tasks/summary", &envelope); err != nil {
 		return nil, err
 	}
 	return envelope.Data, nil
 }
 
-// TaskTemplates 读任务模板类型（GET /v1/tasks/templates/types）。
-func (c *Client) TaskTemplates(ctx context.Context) ([]string, error) {
+// TaskTemplates 读任务模板类型。
+//
+// 实测响应：{"data":{"items":[{"type":"general","typeName":"General"}, …]}}
+func (c *Client) TaskTemplates(ctx context.Context) ([]TaskTemplate, error) {
 	var envelope struct {
 		Data struct {
-			Types []string `json:"types"`
+			Items []TaskTemplate `json:"items"`
 		} `json:"data"`
 	}
 	if err := c.getJSON(ctx, "/v1/tasks/templates/types", nil, "tasks/templates/types", &envelope); err != nil {
 		return nil, err
 	}
-	return envelope.Data.Types, nil
+	return envelope.Data.Items, nil
 }
 
-// TaskRecommendations 读推荐任务（GET /v1/tasks/recommendations）。
+// TaskTemplate 是一个任务模板类型。
+type TaskTemplate struct {
+	Type     string `json:"type"`
+	TypeName string `json:"typeName"`
+}
+
+// TaskRecommendations 读推荐任务。
+//
+// 实测响应：{"object":"list","batchId":null,"generatedAt":null,"data":[],"total":0}
 func (c *Client) TaskRecommendations(ctx context.Context) ([]map[string]any, error) {
 	var envelope struct {
-		Data struct {
-			Items []map[string]any `json:"items"`
-		} `json:"data"`
+		Data []map[string]any `json:"data"`
 	}
 	if err := c.getJSON(ctx, "/v1/tasks/recommendations", nil, "tasks/recommendations", &envelope); err != nil {
 		return nil, err
 	}
-	return envelope.Data.Items, nil
+	return envelope.Data, nil
 }
 
 // ApplyRecommendation 采纳一条推荐任务（POST /v1/tasks/recommendations/{id}/apply）。

@@ -26,7 +26,7 @@ type Turn struct {
 // isMainChat:false + conversationId。
 func (c *Client) Send(ctx context.Context, conversationID, text string) (*Turn, error) {
 	if conversationID == "" {
-		conversationID = c.Config(ctx).MainConversationID
+		conversationID = c.Config(ctx).MessageCapabilities.MainConversationID
 	}
 	clientMessageID := newUUID()
 	partID := newUUID()

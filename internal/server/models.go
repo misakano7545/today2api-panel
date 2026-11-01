@@ -63,13 +63,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
-// planFromPricing 从套餐状态里取套餐标识（typed 版，替代早先的 map 版）。
+// planFromPricing 从套餐状态里取套餐标识。
+//
+// 实测 /v1/pricing/status 的 data.status.plan 是字符串（"free" / "pro" / "ultra"），
+// 不是对象。
 func planFromPricing(p *today.PricingStatus) string {
 	if p == nil {
 		return ""
 	}
-	if p.Plan.Name != "" {
-		return p.Plan.Name
-	}
-	return p.Plan.ID
+	return p.Plan
 }

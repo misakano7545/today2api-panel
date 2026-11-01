@@ -103,7 +103,10 @@ func TestPanelTasksList(t *testing.T) {
 			Title  string `json:"title"`
 			Status string `json:"status"`
 		} `json:"tasks"`
-		Templates []string `json:"templates"`
+		Templates []struct {
+			Type     string `json:"type"`
+			TypeName string `json:"typeName"`
+		} `json:"templates"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
@@ -111,8 +114,8 @@ func TestPanelTasksList(t *testing.T) {
 	if len(out.Tasks) != 1 || out.Tasks[0].ID != "task-1" || out.Tasks[0].Status != "running" {
 		t.Fatalf("tasks = %+v", out.Tasks)
 	}
-	if len(out.Templates) != 2 {
-		t.Fatalf("templates = %+v", out.Templates)
+	if len(out.Templates) != 2 || out.Templates[0].Type != "general" {
+		t.Fatalf("templates = %+v（实测是 [{type,typeName}]）", out.Templates)
 	}
 }
 

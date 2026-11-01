@@ -44,13 +44,15 @@ func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
 			}
 			_, _ = w.Write([]byte(`{"token":"jwt-test","expiresAt":"2099-01-01T00:00:00Z"}`))
 		case r.URL.Path == "/v1/config":
-			_, _ = w.Write([]byte(`{"data":{"messageProtocolVersion":"canonical-v1","mainConversationId":"main","supportsTypedBody":true}}`))
+			_, _ = w.Write([]byte(`{"defaultAvatars":[],"messageCapabilities":{"messageProtocolVersion":"canonical-v1","authSubject":"u1","mainConversationId":"main","supportsTypedBody":true,"supportsLongPoll":true,"longPollWaitMaxMs":25000}}`))
 		case r.URL.Path == "/v1/users/me":
 			_, _ = w.Write([]byte(`{"id":"u1","email":"u1@example.com","plan":"pro"}`))
 		case r.URL.Path == "/v1/pricing/status":
-			_, _ = w.Write([]byte(`{"data":{"status":{"plan":{"id":"pro"},"modelOptions":{"selectedOptionId":"model.deepseek-v4.1-flash","availableOptions":[{"optionId":"model.deepseek-v4.1-flash"},{"optionId":"model.glm-5.3"}]}}}}`))
+			// 实测：plan 是字符串，选项是模式
+			_, _ = w.Write([]byte(`{"success":true,"code":"common.ok","data":{"status":{"plan":"pro","modelOptions":{"selectedOptionId":"mode.balanced","options":[{"id":"mode.balanced","disabled":false},{"id":"mode.power","disabled":true}]}}}}`))
 		case r.URL.Path == "/v1/llm/models":
-			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"deepseek-v4.1-flash"}]}}`))
+			// 实测：{"models":[{"modelId":…}]}
+			_, _ = w.Write([]byte(`{"models":[{"modelId":"claude-opus-5"},{"modelId":"gpt-5.5"}]}`))
 		case r.URL.Path == "/v1/rapport" && r.Method == http.MethodGet:
 			// 第一次读（签到前）与第二次读（签到后）分数不同，用来验证 delta。
 			m.mu.Lock()
@@ -60,13 +62,16 @@ func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
 				points = 90
 			}
 			m.mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-				"points": points, "levelKey": "l2", "level": 2,
-				"levels": []any{map[string]any{"key": "l1", "name": "初见", "points": 0}},
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "code": "common.ok", "data": map[string]any{
+				"rapport": map[string]any{
+					"currentPoints": points, "nextLevelPoints": 100, "progress": 0.2, "isMaxLevel": false,
+					"currentLevel": map[string]any{"key": "origin", "points": 0, "name": "Origin"},
+				},
+				"levels": []any{map[string]any{"key": "origin", "name": "Origin", "points": 0}},
 				"rules": []any{
-					map[string]any{"key": "notification-enabled", "title": "开启通知", "points": 25, "status": "completed"},
-					map[string]any{"key": "discord-joined", "title": "加入 Discord", "points": 25, "status": "completed"},
-					map[string]any{"key": "daily-chat", "title": "每日对话", "points": 10, "status": "pending"},
+					map[string]any{"key": "notification_enabled", "title": "Notification Enabled", "points": 25, "status": "completed", "scoreTrigger": "client_report"},
+					map[string]any{"key": "discord_join_reported", "title": "Discord Joined", "points": 25, "status": "completed", "scoreTrigger": "client_report"},
+					map[string]any{"key": "memory_update", "title": "Memory Update", "points": 2, "status": "available", "scoreTrigger": "server_event"},
 				},
 			}})
 		case strings.HasPrefix(r.URL.Path, "/v1/rapport/actions/") && r.Method == http.MethodPost:
@@ -79,13 +84,13 @@ func newMockToday(t *testing.T) (*httptest.Server, *mockToday) {
 			m.mu.Unlock()
 			_, _ = w.Write([]byte(`{"data":{"ok":true}}`))
 		case r.URL.Path == "/v1/tasks":
-			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"task-1","type":"research","title":"整理周报","status":"running","createdAt":"2026-11-01T00:00:00Z"}]}}`))
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"task-1","type":"research","title":"整理周报","status":"running","createdAt":"2026-11-01T00:00:00Z"}],"nextCursor":null,"hasMore":false}`))
 		case r.URL.Path == "/v1/tasks/summary":
 			_, _ = w.Write([]byte(`{"data":{"running":1,"completed":3}}`))
 		case r.URL.Path == "/v1/tasks/templates/types":
-			_, _ = w.Write([]byte(`{"data":{"types":["research","writing"]}}`))
+			_, _ = w.Write([]byte(`{"success":true,"data":{"items":[{"type":"general","typeName":"General"},{"type":"work","typeName":"Work"}]}}`))
 		case r.URL.Path == "/v1/tasks/recommendations":
-			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"rec-1","title":"试试周报助手"}]}}`))
+			_, _ = w.Write([]byte(`{"object":"list","batchId":null,"data":[{"id":"rec-1","title":"试试周报助手"}],"total":1}`))
 		case r.URL.Path == "/v1/tasks/task-1/stop" && r.Method == http.MethodPost:
 			_, _ = w.Write([]byte(`{"data":{"ok":true}}`))
 		case r.URL.Path == "/v1/pricing/model-option" && r.Method == http.MethodPut:
