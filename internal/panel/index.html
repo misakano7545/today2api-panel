@@ -240,14 +240,17 @@ code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:
         </header>
         <div class="body">
           <div class="row" style="margin-bottom:10px">
-            <input id="memFileName" placeholder="note.md" style="max-width:220px">
+            <input id="memFileName" placeholder="note.md" style="max-width:200px">
+            <input id="memPath" placeholder="/memory/notes/x.md（留空＝由上游决定落点）" style="flex:1">
             <button class="primary" id="memImportBtn">导入</button>
             <label class="hint"><input type="checkbox" id="memWait" checked style="width:auto;margin-right:6px">等它跑完</label>
           </div>
           <textarea id="memContent" rows="8" placeholder="# 要记住的内容&#10;&#10;写成 markdown，越具体越好"></textarea>
           <div class="hint" style="margin-top:8px">
-            这是「导入」不是「覆写」：上游 agent 会决定落到哪个目录、怎么组织正文，
-            可能合并进已有文件。要精确改某一行，得等 DAV 写可达。
+            填了路径就是<b>定点写入</b>：必须是 <code>/memory/&lt;...&gt;</code> 形态，
+            目录不存在会自动建；同路径再写是<b>替换</b>（旧版本归档到 <code>history/</code>）。
+            留空则由上游 agent 自己决定落点，可能合并进已有文件。
+            两种方式正文都可能被 agent 追加「来源」说明。
           </div>
           <div id="memImportResult" style="margin-top:12px"><div class="empty">尚未导入</div></div>
         </div>

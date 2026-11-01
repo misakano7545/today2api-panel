@@ -174,20 +174,32 @@ POST /api/panel/checkin                 # 全账号批量签到（并发 4）
 | `POST …/memories/pin` `{"path":"/memory/notes"}` | `/v1/memories/pins`（顺带校验目录是否存在） |
 | `POST …/memories/unpin` | `DELETE /v1/memories/pins` |
 
-写 —— 注意是**导入**语义，不是覆写：
+写：
 
 | 面板接口 | 上游 |
 |---|---|
-| `POST …/memories/import` `{"filename","content","wait_sec"}` | `POST /v1/files`（multipart）→ `POST /v1/memories/upload` `{fileRef}` → 轮询 `/v1/tasks/{id}` |
+| `POST …/memories/import` `{"filename","content","path","wait_sec"}` | `POST /v1/files`（multipart）→ `POST /v1/memories/upload` `{fileRef,path}` → 轮询 `/v1/tasks/{id}` |
 
-上游会起一个后台任务，由 agent 抽取文件内容后**自己决定落盘到哪个目录、
-用什么文件名、正文怎么组织**，可能合并进已有文件（版本号继续涨）。
-所以：
+`path` 是**定点写入**，必须是 `/memory/<...>` 绝对形态：
 
-- 能「记一条新的」；
-- 不能「把第 3 行改成 X」——没有按行改写的接口，想要精确覆写得等 DAV 写可达；
-- 同一个 `fileRef` 重复提交幂等（回同一 task id + `idempotent: true`），
-  但换个文件传同样内容会再跑一次并叠加。
+- 目录不存在会自动建；
+- 同路径再写是**替换**，旧版本归档到 `history/<path>`（内容是 agent 转述的摘要，不是逐字节原文）；
+- 传了就一定落到该路径；不传则由上游 agent 自己挑目录。
+
+中继的 DAV 垫层也支持 `PUT /memory/<path>`，走的就是这条通道：
+传文件 → 定点导入 → 轮询到终态 → `201`。一次要 **11–21 秒**（等后台 agent），
+DAV 客户端要相应调大超时。`DELETE` / `MKCOL` / `MOVE` 没有对应通道，回 `501`。
+
+两者都是**异步**的：上游起后台任务，agent 抽取文件内容后写盘。差别在落点：
+
+- **不传 `path`**：agent 自己决定目录/文件名，可能合并进已有文件（版本号继续涨）；
+- **传 `path`**：落点由你定，同路径再写是替换，旧版本进 `history/`。
+
+两种情况正文都可能被 agent 追加一段「来源」脚注，也可能不加 —— 这是它的判断，
+客户端关不掉。所以不要假设「读回 == 写进」，用 `updatedAt` 或 activities 判定落地。
+
+同一个 `fileRef` 重复提交幂等（回同一 task id + `idempotent: true`），
+但带上不同的 `path` 会算成新请求（幂等键包含 path）。
 
 任务详情在 `/v1/tasks/{id}`。**`/v2/tasks/{id}` 是 404 的空壳**。
 

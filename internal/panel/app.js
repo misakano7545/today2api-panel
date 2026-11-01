@@ -250,6 +250,7 @@ function renderMemoryImport(out) {
   const t = out.task || {};
   el.innerHTML = `<table><thead><tr><th>项</th><th>值</th></tr></thead><tbody>
     <tr><td>文件</td><td>${esc((out.file && out.file.filename) || "")} · ${esc((out.file && out.file.id) || "")}</td></tr>
+    <tr><td>落点</td><td>${esc(out.path || "由上游 agent 决定")}</td></tr>
     <tr><td>任务</td><td>${esc(t.id || "")}</td></tr>
     <tr><td>状态</td><td>${t.status === "completed" ? badge("已完成", "ok") : badge(esc(t.status || "queued"), "")}</td></tr>
     <tr><td>幂等</td><td>${out.idempotent ? "是（同一文件重复提交）" : "否"}</td></tr>
@@ -676,6 +677,7 @@ $("#memImportBtn").addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({
         filename: ($("#memFileName").value || "").trim() || "note.md",
+        path: ($("#memPath").value || "").trim(),
         content,
         wait_sec: wait,
       }),

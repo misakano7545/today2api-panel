@@ -137,7 +137,31 @@ func (c *Client) UploadFile(ctx context.Context, filename, mimeType string, data
 // 语义是「导入」不是「覆写」：上游起一个后台任务，由 agent 抽取内容、
 // 决定目标目录并重写格式。同一个 fileRef 重复提交幂等。
 func (c *Client) ImportMemory(ctx context.Context, ref FileRef) (*MemoryImportTask, bool, error) {
+	return c.importMemory(ctx, ref, "")
+}
+
+// ImportMemoryTo 把上传的文件导入到**指定路径**。
+//
+// target 必须是 `/memory/<...>` 的绝对形态，相对形态上游回
+// `400 {"error":"Invalid memory path"}`。目录不存在会自动创建
+// （实测 `/memory/verify-deep/sub/newfile.md` 直接写成功）。
+//
+// 与不带 target 的导入相比，这是「定点写入」：同路径再次导入会
+// 先 deleted 旧的再 created 新的（activities 里能直接看到），
+// 也就是**替换**而不是叠加。正文原样保留，上游 agent 会在末尾
+// 追加一段「来源」说明——这是它自己的行为，无法关闭。
+func (c *Client) ImportMemoryTo(ctx context.Context, ref FileRef, target string) (*MemoryImportTask, bool, error) {
+	if !strings.HasPrefix(target, "/memory/") || len(target) <= len("/memory/") {
+		return nil, false, &Error{Kind: KindServer, Msg: "memory path 必须是 /memory/<...> 形态: " + target}
+	}
+	return c.importMemory(ctx, ref, target)
+}
+
+func (c *Client) importMemory(ctx context.Context, ref FileRef, target string) (*MemoryImportTask, bool, error) {
 	body := map[string]any{"fileRef": ref}
+	if target != "" {
+		body["path"] = target
+	}
 	status, raw, err := c.doRaw(ctx, http.MethodPost, "/v1/memories/upload", "application/json", jsonReader(body))
 	if err != nil {
 		return nil, false, err

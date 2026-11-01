@@ -962,3 +962,88 @@ GET    /v1/memories/about-user                      → 200 {fullContent,plainCo
 任务详情走 `/v1/tasks/{id}`。**`/v2/tasks/{id}` 是 404 的空壳**，
 一开始按 `/v2` 写，表现是导入接口 3 秒就返回 `status:"queued"`、
 轮询那步静默失败——排查时注意这个坑。
+
+---
+
+## 12. 记忆定点写入：`path` 字段把「导入」变成「替换」
+
+第 11 节说「不能把第 3 行改成 X」。继续挖之后这个结论要修正一半：
+**位置能精确指定，同路径再写是替换**，只是正文可能被 agent 追加脚注。
+
+### 12.1 先排掉的死路
+
+| 尝试 | 结果 | 说明 |
+|---|---|---|
+| `PUT /v1/memories/files`、`/file`、`/content` | `404` | 路由不存在 |
+| `PATCH` 任意路径（含 `/zzz-junk`） | `400` 空 body | **边缘直接拦**，不带信息量，别当成路由存在 |
+| `PUT /v1/memories/pins`、`PUT /zzz-junk` | 都 `404` | `/api/cloud` 通道对 PUT 根本没路由 |
+| `GET /v1/memory`、`/v1/memories/files`… 共 19 条候选 | 全 `404` | 没有未公开的 REST 面 |
+| `X-HTTP-Method-Override: PUT` | `400` | 应用不认方法覆盖 |
+| `/v1/files/{fileId}/versions/{versionId}` | 只有 `GET` 和 `POST …/links` | 没有「新建版本」入口 |
+
+记忆文件对象本身也只暴露 `path / name / contentType / content / updatedAt`，
+**没有 fileId、没有 versionId**，所以没法借 `/v1/files` 的版本接口去写它。
+
+### 12.2 `path` 是真字段，判定方法值得记
+
+`POST /v1/memories/upload` 的 schema 对未知字段是**宽松**的（加了 `nonsense`
+照样 202），所以「加了不报错」不能证明字段存在。真正能判的是**幂等键**：
+
+```text
+{fileRef}                → 202 task 01a1968f-5b61…
+{fileRef, nonsense:123}  → 202 task 01a1968f-5b61…   ← 同 id，被忽略
+{fileRef, targetPath:…}  → 200 task 01a1968f-5b61…   ← 同 id + idempotent，被忽略
+{fileRef, path:"/memory/notes/forced.md"}
+                         → 202 task 01a1968f-5dd7…   ← **新 id，字段被吃进幂等键**
+```
+
+幂等键变了 = 字段参与了请求语义。这是在没有文档的情况下唯一可靠的判据。
+
+### 12.3 形态要求：必须是绝对路径
+
+```json
+{"fileRef":{…},"path":"notes/forced.md"}        → 400 {"error":"Invalid memory path"}
+{"fileRef":{…},"path":"/memory/notes/forced.md"} → 202
+```
+
+目录不存在会自动创建：`/memory/verify-deep/sub/newfile.md` 直接写成功。
+
+### 12.4 同路径再写 = 替换，旧版本进 `history/`
+
+```text
+10:04:40  deleted  notes/forced.md  v2
+10:04:43  created  notes/forced.md  v3
+```
+
+或者走「更新 + 归档」形态：
+
+```text
+10:10:17  updated  notes/dav-put.md           v2
+10:10:22  created  history/notes/dav-put.md   v1
+```
+
+归档内容不是逐字节原文，是 agent 重述过的摘要（保留了标题与要点，
+并标了 `superseded <时间>`）。所以**回滚是可能的但会失真**：
+把 `history/<path>` 的内容再写回原路径即可，措辞以当时的转述为准。
+
+### 12.5 唯一改不掉的偏差：可能多一段脚注
+
+同一次会话里两种表现都出现过：
+
+- 第一次 PUT 读回来，正文后多了 `## 来源` / `## 事实` 两节；
+- 第二次 PUT 读回来，就是我写进去的三行，**一个字节没多**。
+
+也就是说加不加脚注是 agent 自己的判断，客户端无法开关。做写回滚环时
+不要假设「读回 == 写进」，要用 `updatedAt` 或 activities 判定落地。
+
+### 12.6 落到代码
+
+| 位置 | 内容 |
+|---|---|
+| `internal/today/memory.go` | `ImportMemoryTo(ctx, ref, target)`；`target` 必须是 `/memory/<...>`，否则本地就报错，不打上游 |
+| `internal/server/memory.go` | 面板 `POST …/memories/import` 支持 `path`，响应里回带 `path` 便于核对落点 |
+| `cmd/relay/memory.go` | DAV `PUT /memory/<path>` → 传文件 → 定点导入 → 轮询到终态 → `201`；`DELETE`/`MKCOL`/`MOVE` 仍回 `501` |
+| `cmd/relay/memory_put_test.go` | 4 个用例：定点路径、上传丢 Authorization、空路径/空 body、轮询到终态 |
+
+实测一次 PUT 耗时 **11–21 秒**（要等 agent 后台任务跑完才回 201），
+所以 DAV 客户端那边可能要先调大超时。

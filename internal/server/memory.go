@@ -142,6 +142,8 @@ func (s *Server) handleMemoryImport(w http.ResponseWriter, r *http.Request) {
 		Filename string `json:"filename"`
 		Content  string `json:"content"`
 		WaitSec  int    `json:"wait_sec"`
+		// Path 非空即定点写入：必须是 /memory/<...>，同路径再写是替换。
+		Path string `json:"path"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -175,7 +177,14 @@ func (s *Server) handleMemoryImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	task, idempotent, err := client.ImportMemory(base, file.FileRef)
+	target := strings.TrimSpace(body.Path)
+	var task *today.MemoryImportTask
+	var idempotent bool
+	if target != "" {
+		task, idempotent, err = client.ImportMemoryTo(base, file.FileRef, target)
+	} else {
+		task, idempotent, err = client.ImportMemory(base, file.FileRef)
+	}
 	if err != nil {
 		s.pool.Report(acct.ID, err, "")
 		writeError(w, http.StatusBadGateway, err.Error())
@@ -204,6 +213,7 @@ func (s *Server) handleMemoryImport(w http.ResponseWriter, r *http.Request) {
 		"file":       file,
 		"task":       task,
 		"idempotent": idempotent,
+		"path":       target,
 		"terminal":   isTerminalTaskStatus(task.Status),
 	})
 }
