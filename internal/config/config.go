@@ -147,6 +147,14 @@ func (c *Config) Normalize() {
 			pair.dst.Audience = pair.def.API
 		}
 	}
+
+	// 手写/手改的配置里，accounts[].cookie 常是裸 session 值。
+	// 面板 API 那条路会 NormalizeCookie，从文件加载这条路也必须归一，
+	// 否则请求头变成没有名字的畸形 Cookie，换票直接 401。
+	for i := range c.Accounts {
+		c.Accounts[i].Cookie = NormalizeCookie(c.Accounts[i].Cookie)
+		c.Accounts[i].Token = strings.TrimSpace(c.Accounts[i].Token)
+	}
 }
 
 // NormalizeCookie 接受「整段 Cookie 头」或「只有 session 值」两种粘贴方式。
