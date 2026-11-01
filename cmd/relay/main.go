@@ -313,6 +313,13 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	setCookies := resp.Header.Values("Set-Cookie")
+	// 把 Set-Cookie 的「名字 + 有效期」记进日志（不记值）。这是判断会话
+	// 能否滚动的唯一实证：better-auth 在 session.updateAge 之后会带一份
+	// 新的 Set-Cookie 回来，Max-Age 重置 = 会话被续命。
+	for _, sc := range setCookies {
+		h.logf("  ↳ Set-Cookie %s", describeCookie(sc))
+	}
+
 	// auth 域名的响应要读下来，登录时用来把 raw token 和签名 Cookie 对上。
 	var bodyBytes []byte
 	if rt.Prefix == "" {
@@ -338,6 +345,27 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n, _ = io.Copy(w, resp.Body)
 	}
 	h.logf("%s %s%s → %s %d (%dB)", r.Method, host, r.URL.Path, target, resp.StatusCode, n)
+}
+
+// describeCookie 只输出 Cookie 名与有效期属性，绝不输出值。
+func describeCookie(sc string) string {
+	parts := strings.Split(sc, ";")
+	out := strings.TrimSpace(strings.SplitN(parts[0], "=", 2)[0])
+	var attrs []string
+	for _, p := range parts[1:] {
+		p = strings.TrimSpace(p)
+		low := strings.ToLower(p)
+		if strings.HasPrefix(low, "max-age") ||
+			strings.HasPrefix(low, "expires") ||
+			low == "secure" || low == "httponly" ||
+			strings.HasPrefix(low, "samesite") {
+			attrs = append(attrs, p)
+		}
+	}
+	if len(attrs) > 0 {
+		out += " {" + strings.Join(attrs, "; ") + "}"
+	}
+	return out
 }
 
 func (h *handler) logf(format string, args ...any) {
