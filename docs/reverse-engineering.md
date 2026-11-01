@@ -732,7 +732,13 @@ POST /v1/chat/completions (stream) → 200 SSE，delta 分块
 > 注意：命令行里直接塞中文会被 MSYS 按 GBK 传出去，上游存成乱码。
 > 测中文请用 UTF-8 文件 + `--data-binary @file`。这不是网关的问题。
 
-## 9. 记忆页：WebDAV，且现网下结构性不可达
+## 9. 记忆页：WebDAV（**本节结论已作废，见第 12 节**）
+
+> 更正：本节把 `/memory` 判成「结构性不可达」是错的——当时只测了根路径的
+> `PROPFIND`。实测 `GET`/`PUT`/`DELETE` 全都通，坏的只有列举。
+> 完整矩阵与修正后的分工见 **§12**。下面保留原文，作为「只测一个方法就下结论」
+> 的反面教材。
+
 
 ### 9.1 现象
 
@@ -1047,3 +1053,71 @@ GET    /v1/memories/about-user                      → 200 {fullContent,plainCo
 
 实测一次 PUT 耗时 **11–21 秒**（要等 agent 后台任务跑完才回 201），
 所以 DAV 客户端那边可能要先调大超时。
+
+---
+
+## 12. 更正：/memory 的 DAV 只有「列目录」坏了，文件级读写本来就是通的
+
+第 9 节和第 11 节把 `/memory` 判定成「DAV 结构性不可达」，**那是个错误结论**。
+错因很具体：当时只测了根路径的 `PROPFIND /memory`，看到 400/504 就认定整条
+DAV 通道废了，于是垫层对 `PUT` 直接回了 501 —— 等于把上游本来支持的能力
+自己在网关侧封掉。今天按方法逐个补测，真实矩阵是：
+
+| 方法 | 路径 | 结果 |
+|---|---|---|
+| `GET` | `/api/cloud/memory/notes/test-memory.md` | **200**，返回真实正文 |
+| `PUT` | `/api/cloud/memory/notes/probe.md` | **201**（新建） |
+| `PUT` | `/api/cloud/memory/notes/probe.md`（已存在） | **201**（覆盖） |
+| `GET` | 覆盖后回读 | **200**，与写入**字节完全一致** |
+| `DELETE` | `/api/cloud/memory/notes/probe.md` | **204**，之后 GET → 404 |
+| `PROPFIND` | `/memory`、`/memory/notes`、`/memory/notes/x.md` | 无 body → 边缘 **400**；带 XML body → **504** |
+| `MKCOL` | `/api/cloud/memory/probe-dir` | **404** |
+| `PROPPATCH` | `/api/cloud/memory/notes/x.md` | **504** |
+| `COPY` | `/api/cloud/memory/notes/probe.md` | 200 但回的是正文，等同没实现 |
+
+结论修正为：**只有列举（PROPFIND）走不通，文件级 CRUD 全部可用，且不经过
+agent、不追加任何脚注。** 这推翻了第 11 节的判断 —— 那会儿以为写只能走
+`/v1/memories/upload` 的导入语义，其实原生 PUT 一直在。
+
+### 12.1 于是分两条写入路径，语义完全不同
+
+| | 精确覆写 | 导入 |
+|---|---|---|
+| 接口 | `PUT /memory/<path>` | `POST /v1/files` → `POST /v1/memories/upload` |
+| 耗时 | 毫秒级 | 11–21 秒（等后台 agent） |
+| 正文 | **原样落盘**，回读字节一致 | agent 抽取重写，可能加「来源」脚注 |
+| 落点 | 你指定的路径 | 传 `path` 可定点，不传由 agent 挑 |
+| 版本 | **不留历史**，覆盖即丢 | 旧版本可能被归档到 `history/<path>` |
+| 用途 | 改某一行、批量维护 | 记一条新的、从文档里抽事实 |
+
+`history/<path>` 不是 PUT 自动产生的：PUT 三次 `hist-probe.md`（version A/B/C），
+history 下没有对应条目；那条 `history/notes/dav-put.md` 是**导入路径的 agent**
+把被覆盖的旧版本摘要归档出来的，内容是它的转述，不是逐字节原文。
+要留历史就只能走导入，或者自己在客户端做备份。
+
+### 12.2 中继垫层的正确分工
+
+```go
+switch r.Method {
+case "PROPFIND":   // 上游坏掉，用 /v1/memories/pins 拼 207
+case GET, HEAD, PUT, DELETE:  // 上游原生可用，原样转发
+default:           // MKCOL/MOVE/COPY/PROPPATCH → 501
+}
+```
+
+三个曾经踩过的点，都留在代码注释里：
+
+1. **预检不带 Authorization**，`OPTIONS` 必须在鉴权之前放行，否则浏览器掐掉
+   后面的 PROPFIND；
+2. 垫层自己回包必须自己给 CORS（渲染层 `Origin: http://today-desktop.localhost`
+   是跨域，带凭证要回显 Origin，不能用 `*`）；
+3. 写操作之后要清 pins 缓存，否则紧接着的刷新还是旧列表。
+
+### 12.3 怎么确认写进去了
+
+面板的 `PUT …/memories/file` 写完会立刻 `GET` 回读，返回
+`"verified": true/false` —— 不靠 `updatedAt`、不靠 activities，直接比字节。
+上游 PUT 是同步的，回读拿到的就是刚写的，这条断言可靠。
+
+DAV 侧的验证：客户端 `PROPFIND` 出来的 href 里能看到面板写的新文件，
+`GET` 回来也是同一份内容（实测 `/memory/notes/ui-edit.md`）。

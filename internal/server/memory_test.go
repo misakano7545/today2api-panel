@@ -172,6 +172,138 @@ func newMemoryServer(t *testing.T, upstream string) *Server {
 	})
 }
 
+// 精确读写：GET/PUT/DELETE 必须直打上游 DAV，内容不经 agent。
+// 早前把「PROPFIND 400」当成「整个 DAV 不可达」，写请求被回 501，
+// 等于自己封掉了上游本来支持的能力；这组用例锁住直通行为。
+func TestPanelMemoryFileDirect(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	files := map[string]string{"/memory/notes/a.md": "# 旧内容\n"}
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/token" {
+			_, _ = w.Write([]byte(`{"token":"jwt-test","expiresAt":"2099-01-01T00:00:00Z"}`))
+			return
+		}
+		if !strings.Contains(r.URL.Path, "/memory/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		// 上游基址在测试里可能带或不带 /api/cloud 前缀，统一归一成 /memory/...
+		key := r.URL.Path[strings.Index(r.URL.Path, "/memory/"):]
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls = append(calls, r.Method+" "+key+" "+string(body))
+		cur, exists := files[key]
+		switch r.Method {
+		case http.MethodPut:
+			files[key] = string(body)
+		case http.MethodDelete:
+			delete(files, key)
+		}
+		mu.Unlock()
+
+		switch r.Method {
+		case http.MethodGet:
+			if !exists {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/markdown")
+			_, _ = w.Write([]byte(cur))
+		case http.MethodPut:
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer up.Close()
+
+	s := newMemoryServer(t, up.URL)
+
+	// 写
+	put := req(http.MethodPut,
+		"/api/panel/accounts/acc_1/memories/file?path=/memory/notes/a.md",
+		strings.NewReader("# 新内容\n第二行\n"))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, put)
+	if rec.Code != 200 {
+		t.Fatalf("PUT 面板接口失败 %d: %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	// 面板写完会立刻回读校验，最后一次请求是 GET；
+	// 所以按「调用记录」断言，确认出现过原样 PUT。
+	wantCall := "PUT /memory/notes/a.md # 新内容\n第二行\n"
+	found := false
+	for _, c := range calls {
+		if c == wantCall {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("没有出现原样 PUT 调用，实际: %#v", calls)
+	}
+	mu.Unlock()
+
+	var putOut struct {
+		Verified bool `json:"verified"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &putOut)
+	if !putOut.Verified {
+		t.Error("写完回读应证明字节一致")
+	}
+
+	// 读
+	recGet := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recGet, req(http.MethodGet,
+		"/api/panel/accounts/acc_1/memories/file?path=/memory/notes/a.md", nil))
+	if recGet.Code != 200 {
+		t.Fatalf("GET 失败 %d: %s", recGet.Code, recGet.Body.String())
+	}
+	var gotOut struct {
+		Content string `json:"content"`
+	}
+	_ = json.Unmarshal(recGet.Body.Bytes(), &gotOut)
+	if gotOut.Content != "# 新内容\n第二行\n" {
+		t.Fatalf("回读不一致: %q", gotOut.Content)
+	}
+
+	// 删
+	recDel := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recDel, req(http.MethodDelete,
+		"/api/panel/accounts/acc_1/memories/file?path=/memory/notes/a.md", nil))
+	if recDel.Code != 200 {
+		t.Fatalf("DELETE 失败 %d: %s", recDel.Code, recDel.Body.String())
+	}
+
+	recGone := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recGone, req(http.MethodGet,
+		"/api/panel/accounts/acc_1/memories/file?path=/memory/notes/a.md", nil))
+	if recGone.Code == 200 {
+		t.Fatal("删掉之后还能读到")
+	}
+}
+
+// 路径必须限定在 /memory/ 下，别拿面板当任意路径代理。
+func TestPanelMemoryFileRejectsBadPath(t *testing.T) {
+	up, _ := newMemoryMock(t)
+	s := newMemoryServer(t, up.URL)
+
+	for _, p := range []string{
+		"/api/panel/accounts/acc_1/memories/file?path=/etc/passwd",
+		"/api/panel/accounts/acc_1/memories/file?path=/memory/../secret",
+		"/api/panel/accounts/acc_1/memories/file?path=",
+	} {
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req(http.MethodGet, p, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s 应被拒，得到 %d", p, rec.Code)
+		}
+	}
+}
+
 func TestPanelMemoryListEmpty(t *testing.T) {
 	up, _ := newMemoryMock(t)
 	s := newMemoryServer(t, up.URL)

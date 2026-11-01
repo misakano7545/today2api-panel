@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/xml"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -77,25 +78,89 @@ func TestWriteMultistatus(t *testing.T) {
 	}
 }
 
-func TestWriteMemoryFileMatching(t *testing.T) {
-	h := &handler{}
-	pins := &memoryPins{Items: []memoryPin{
-		{Path: "/memory/about-user", Files: []memoryFile{
-			{Path: "/memory/about-user/profile.md", Content: "hi", ContentType: "text/markdown"},
-		}},
-	}}
+// GET/PUT/DELETE 必须原样转发到上游：内容不经任何改写。
+// 旧实现把 PUT 翻成「传文件 → 导入」，正文会被 agent 重写；
+// 现在上游原生支持 PUT，必须直通。
+func TestMemoryForwardsVerbatim(t *testing.T) {
+	var gotMethod, gotPath, gotBody, gotCT string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotCT = r.Method, r.URL.Path, r.Header.Get("Content-Type")
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		gotBody = string(buf[:n])
+		if r.URL.Path == "/api/cloud/memory/gone.md" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/markdown")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("上游回包"))
+	}))
+	defer upstream.Close()
 
-	req := httptest.NewRequest("GET", "/memory/about-user/profile.md", nil)
+	rt := route{Upstream: upstream.URL, Prefix: "/api/cloud", App: "https://todayai.cn"}
+	h := &handler{client: upstream.Client()}
+
+	req := httptest.NewRequest("PUT", "/memory/notes/a.md", strings.NewReader("# 正文\n"))
+	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("Content-Type", "text/markdown")
 	rec := httptest.NewRecorder()
-	h.writeMemoryFile(rec, req, pins)
-	if rec.Code != 200 || rec.Body.String() != "hi" {
-		t.Fatalf("取文件失败: %d %q", rec.Code, rec.Body.String())
+	h.serveMemoryDAV(rec, req, rt)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("PUT 转发失败: %d %s", rec.Code, rec.Body.String())
+	}
+	if gotMethod != "PUT" || gotPath != "/api/cloud/memory/notes/a.md" {
+		t.Fatalf("上游收到 %s %s", gotMethod, gotPath)
+	}
+	if gotBody != "# 正文\n" {
+		t.Fatalf("正文被改写: %q", gotBody)
+	}
+	if gotCT != "text/markdown" {
+		t.Fatalf("Content-Type 丢了: %q", gotCT)
+	}
+	if rec.Body.String() != "上游回包" {
+		t.Fatalf("响应未原样回传: %q", rec.Body.String())
 	}
 
-	rec2 := httptest.NewRecorder()
-	h.writeMemoryFile(rec2, httptest.NewRequest("GET", "/memory/nope.md", nil), pins)
-	if rec2.Code != 404 {
-		t.Fatalf("缺失文件想要 404，得到 %d", rec2.Code)
+	// DELETE 也要直通，不能回 501。
+	reqDel := httptest.NewRequest("DELETE", "/memory/gone.md", nil)
+	reqDel.Header.Set("Authorization", "Bearer tok")
+	recDel := httptest.NewRecorder()
+	h.serveMemoryDAV(recDel, reqDel, rt)
+	if recDel.Code != http.StatusNotFound {
+		t.Fatalf("DELETE 上游 404 应原样透传，得到 %d", recDel.Code)
+	}
+}
+
+// 真正做不到的只有 MKCOL/PROPPATCH，必须明确 501，不能假装成功。
+func TestMemoryUnsupportedMethods(t *testing.T) {
+	h := &handler{client: http.DefaultClient}
+	rt := route{Prefix: "/api/cloud", App: "https://todayai.cn"}
+	for _, m := range []string{"MKCOL", "PROPPATCH", "MOVE", "COPY"} {
+		req := httptest.NewRequest(m, "/memory/x", nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		h.serveMemoryDAV(rec, req, rt)
+		if rec.Code != http.StatusNotImplemented {
+			t.Errorf("%s 期望 501，得到 %d", m, rec.Code)
+		}
+	}
+}
+
+// 预检不带 Authorization，必须在鉴权之前放行，且要带 CORS 头。
+func TestMemoryPreflightWithoutAuth(t *testing.T) {
+	h := &handler{client: http.DefaultClient}
+	req := httptest.NewRequest("OPTIONS", "/memory", nil)
+	req.Header.Set("Origin", "http://today-desktop.localhost")
+	req.Header.Set("Access-Control-Request-Method", "PROPFIND")
+	rec := httptest.NewRecorder()
+	h.serveMemoryDAV(rec, req, route{Prefix: "/api/cloud"})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("预检期望 204，得到 %d", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "http://today-desktop.localhost" {
+		t.Fatalf("CORS 未回显 Origin: %q", got)
 	}
 }
 

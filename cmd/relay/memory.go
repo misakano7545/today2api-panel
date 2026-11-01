@@ -1,38 +1,34 @@
 package main
 
-// /memory 的只读 WebDAV 垫层。
+// /memory 的 WebDAV 垫层 —— 只补「列目录」这一个坏掉的方法。
 //
-// 背景（实测，2026-11-01）：
-//   - 记忆页的列表走 WebDAV：PROPFIND /memory，Depth: infinity，无 body；
-//     客户端用 DOMParser 解析 207 Multi-Status，取 href/displayname/
-//     collection/getcontenttype/getlastmodified。
-//   - 本机到 api.todayai.cn 的 ALB 被封，唯一可用通道是
-//     todayai.cn/api/cloud/:path*（Next 服务端 rewrite）。
-//   - 但 Next rewrite 承载不了 PROPFIND：
-//       · 不带 body        → 边缘 400 "Bad Request"（11B）
-//       · Content-Length:0 → Next 自己 400 的 HTML
-//       · 带 body          → 转发后 72s 超时 504
-//     也就是说 DAV 这条路在当前网络下结构性不可达。
+// 实测结论（2026-11-01，真实 pro 账号，通道 todayai.cn/api/cloud）：
 //
-// 所以这里用 /v1/memories/pins 的真实数据重新拼一份 207 响应。
-// 数据是真的，只是换了个传输形状；没有编造任何内容。
+//	GET    /memory/<path>   200  真实正文
+//	PUT    /memory/<path>   201  新建与覆盖都行
+//	DELETE /memory/<path>   204
+//	PROPFIND（任意层级）     ✗   无 body → 边缘 400；带 body → 504
+//	MKCOL / PROPPATCH        ✗   404 / 504
 //
-// PUT 走另一条：/v1/memories/upload 的 path 字段可以定点落盘，
-// 同路径再写是替换（上游先 deleted 旧版本再 created 新版本）。
-// MKCOL/MOVE/COPY/DELETE 没有对应通道，明确回 501，
-// 并且在列表里不返回 canDelete/canRename，客户端会把删改入口收起来，
-// 而不是让用户点下去再失败。
+// 所以文件级读写本来就是通的。早期「DAV 结构性不可达」的判断是错的——
+// 当时只试了根路径的 PROPFIND，把「列表坏了」误当成「整个 DAV 坏了」，
+// 于是垫层对写请求回了 501，等于把本来能用的功能自己封掉。坏掉的只有列举。
+//
+// 现在的分工：
+//   - GET/HEAD/PUT/DELETE 原样转发，内容一字节不改（PUT 之后 GET 回来的
+//     就是写进去的东西，不经过 agent 改写）；
+//   - PROPFIND 用 /v1/memories/pins 的真实数据拼 207 —— 列表只覆盖
+//     「被钉住的目录」，想看别的目录先钉它；
+//   - MKCOL/MOVE/COPY/PROPPATCH 明确回 501，别让客户端以为存上了。
+//
+// 渲染层页面在 http://today-desktop.localhost，打 api.todayai.cn 属跨域，
+// 所以垫层回包必须自带 CORS；预检不带 Authorization，必须在鉴权前放行。
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"encoding/xml"
-	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
-	"net/textproto"
 	"strings"
 	"sync"
 	"time"
@@ -76,25 +72,16 @@ func (h *handler) fetchPins(rt route, auth string) (*memoryPins, error) {
 	}
 	h.pins.mu.Unlock()
 
-	url := strings.TrimRight(rt.Upstream, "/") + rt.Prefix + "/v1/memories/pins"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
+	req, errReq := h.memoryRequest(rt, http.MethodGet, "/v1/memories/pins", auth, "", nil)
+	if errReq != nil {
+		return nil, errReq
 	}
-	req.Header.Set("Authorization", auth)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-App-Version", "1.24.0")
-	req.Header.Set("X-Client-Platform", "windows-client")
-
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return nil, err
+	resp, errDo := h.client.Do(req)
+	if errDo != nil {
+		return nil, errDo
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, err
-	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode != http.StatusOK {
 		return nil, &davError{status: resp.StatusCode, body: body}
 	}
@@ -108,6 +95,13 @@ func (h *handler) fetchPins(rt route, auth string) (*memoryPins, error) {
 	h.pins.pins, h.pins.key, h.pins.at = out, auth, time.Now()
 	h.pins.mu.Unlock()
 	return out, nil
+}
+
+// invalidatePins 在写操作之后清缓存，否则紧接着的刷新还是旧列表。
+func (h *handler) invalidatePins() {
+	h.pins.mu.Lock()
+	h.pins.pins = nil
+	h.pins.mu.Unlock()
 }
 
 type davError struct {
@@ -131,23 +125,23 @@ func applyCORS(w http.ResponseWriter, r *http.Request) {
 		if req := r.Header.Get("Access-Control-Request-Headers"); req != "" {
 			w.Header().Set("Access-Control-Allow-Headers", req)
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, HEAD, PROPFIND")
+		w.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND")
 		w.Header().Set("Access-Control-Max-Age", "600")
 		return
 	}
 	w.Header().Set("Access-Control-Expose-Headers", "DAV, Content-Length, Content-Type")
 }
 
+const memoryAllow = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND"
+
 // serveMemoryDAV 处理 /memory 及其子路径。
 func (h *handler) serveMemoryDAV(w http.ResponseWriter, r *http.Request, rt route) {
-	// 渲染层页面在 http://today-desktop.localhost，打 api.todayai.cn 属跨域。
-	// 垫层自己回包就必须自己给 CORS 头，否则预检就挂，PROPFIND 根本发不出来。
 	applyCORS(w, r)
 
 	// 预检请求不带 Authorization，必须在鉴权之前放行。
 	if r.Method == http.MethodOptions {
 		w.Header().Set("DAV", "1")
-		w.Header().Set("Allow", "OPTIONS, GET, HEAD, PROPFIND")
+		w.Header().Set("Allow", memoryAllow)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -158,45 +152,69 @@ func (h *handler) serveMemoryDAV(w http.ResponseWriter, r *http.Request, rt rout
 		return
 	}
 
-	pins, err := h.fetchPins(rt, auth)
-	if err != nil {
-		code := http.StatusBadGateway
-		if de, ok := err.(*davError); ok {
-			code = de.status
-		}
-		h.logf("memory: 拉 pins 失败: %v", err)
-		http.Error(w, err.Error(), code)
-		return
-	}
-
 	switch r.Method {
 	case "PROPFIND":
-		h.logf("memory DAV PROPFIND %s → 本地垫层 207（%d 条 pin）", r.URL.Path, len(pins.Items))
+		pins, err := h.fetchPins(rt, auth)
+		if err != nil {
+			code := http.StatusBadGateway
+			if de, ok := err.(*davError); ok {
+				code = de.status
+			}
+			h.logf("memory: 拉 pins 失败: %v", err)
+			http.Error(w, err.Error(), code)
+			return
+		}
+		h.logf("memory DAV PROPFIND %s → 本地拼装 207（%d 条 pin）", r.URL.Path, len(pins.Items))
 		h.writeMultistatus(w, r, pins)
 		return
 
-	case http.MethodGet, http.MethodHead:
-		h.logf("memory DAV %s %s → 本地垫层", r.Method, r.URL.Path)
-		h.writeMemoryFile(w, r, pins)
-		return
-
-	case http.MethodPut:
-		h.handleMemoryPut(w, r, rt, auth)
-		return
-
-	case http.MethodDelete:
-		// 上游没有删除记忆文件的 REST 接口，DAV DELETE 也走不通。
-		w.Header().Set("Allow", "OPTIONS, GET, HEAD, PROPFIND, PUT")
-		http.Error(w, "memory 删除不可用", http.StatusNotImplemented)
+	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete:
+		// 文件级操作上游原生支持，原样转发，不经过任何转换。
+		h.forwardMemory(w, r, rt, auth)
 		return
 
 	default:
-		// 其他写操作（MKCOL/MOVE/COPY/PROPPATCH）没有对应通道，直说，
-		// 别让客户端以为存上了。
-		w.Header().Set("Allow", "OPTIONS, GET, HEAD, PROPFIND, PUT")
-		http.Error(w, "memory 该写方法不可用", http.StatusNotImplemented)
+		// MKCOL / MOVE / COPY / PROPPATCH：上游确实没有，直接说。
+		w.Header().Set("Allow", memoryAllow)
+		http.Error(w, "memory DAV: "+r.Method+" 不受支持（上游只支持 GET/PUT/DELETE）", http.StatusNotImplemented)
 		return
 	}
+}
+
+// forwardMemory 把请求原样转发到上游，响应原样回给客户端。
+func (h *handler) forwardMemory(w http.ResponseWriter, r *http.Request, rt route, auth string) {
+	req, errReq := h.memoryRequest(rt, r.Method, r.URL.RequestURI(), auth,
+		r.Header.Get("Content-Type"), r.Body)
+	if errReq != nil {
+		http.Error(w, errReq.Error(), http.StatusBadGateway)
+		return
+	}
+	req.ContentLength = r.ContentLength
+
+	resp, errDo := h.client.Do(req)
+	if errDo != nil {
+		h.logf("memory DAV %s %s → ERR %v", r.Method, r.URL.Path, errDo)
+		http.Error(w, errDo.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		h.invalidatePins()
+	}
+
+	for k, vs := range resp.Header {
+		switch k {
+		case "Connection", "Keep-Alive", "Transfer-Encoding", "Content-Length":
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	n, _ := io.Copy(w, io.LimitReader(resp.Body, 8<<20))
+	h.logf("memory DAV %s %s → %d (%dB)", r.Method, r.URL.Path, resp.StatusCode, n)
 }
 
 func (h *handler) writeMultistatus(w http.ResponseWriter, r *http.Request, pins *memoryPins) {
@@ -258,35 +276,6 @@ func (h *handler) writeMultistatus(w http.ResponseWriter, r *http.Request, pins 
 	}
 }
 
-func (h *handler) writeMemoryFile(w http.ResponseWriter, r *http.Request, pins *memoryPins) {
-	want := pathClean(r.URL.Path)
-	if want == "/memory" || want == "/memory/" {
-		// 根路径当目录取，直接回 405，别回 HTML 让客户端解析出乱码。
-		http.Error(w, "is a collection", http.StatusMethodNotAllowed)
-		return
-	}
-
-	for _, p := range pins.Items {
-		for _, f := range p.Files {
-			if pathClean(f.Path) != want {
-				continue
-			}
-			ct := f.ContentType
-			if ct == "" {
-				ct = "application/octet-stream"
-			}
-			w.Header().Set("Content-Type", ct)
-			w.Header().Set("Content-Length", itoa(len(f.Content)))
-			w.WriteHeader(http.StatusOK)
-			if r.Method != http.MethodHead {
-				_, _ = io.WriteString(w, f.Content)
-			}
-			return
-		}
-	}
-	http.Error(w, "not found", http.StatusNotFound)
-}
-
 func pathClean(p string) string {
 	if p == "" {
 		return "/"
@@ -303,202 +292,10 @@ func pathClean(p string) string {
 	return p
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
-}
-
-// handleMemoryPut 把 DAV 的 PUT 翻成「传文件 → 定点导入 → 轮询到终态」。
-//
-// 上游没有直接写记忆文件的接口，但 /v1/memories/upload 的 path 字段
-// 可以指定落盘位置：同路径再写会先 deleted 旧的再 created 新的，
-// 也就是替换。实测目录不存在会自动创建。
-//
-// 有一个改不掉的偏差：上游 agent 会把正文原样保留，但会在末尾追加
-// 一段「来源」说明。所以 PUT 之后 GET 回来的内容会比写进去的多几行，
-// 这是上游行为，不是这里改写。
-func (h *handler) handleMemoryPut(w http.ResponseWriter, r *http.Request, rt route, auth string) {
-	body, errRead := io.ReadAll(io.LimitReader(r.Body, 4<<20))
-	if errRead != nil {
-		http.Error(w, "read body: "+errRead.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(body) == 0 {
-		http.Error(w, "empty body", http.StatusBadRequest)
-		return
-	}
-
-	// DAV 路径 /memory/a/b.md → 上游要求的 /memory/a/b.md（绝对形态）。
-	target := pathClean(r.URL.Path)
-	if !strings.HasPrefix(target, "/memory/") || len(target) <= len("/memory/") {
-		http.Error(w, "memory path 必须是 /memory/<...>", http.StatusBadRequest)
-		return
-	}
-
-	mimeType := r.Header.Get("Content-Type")
-	if mimeType == "" {
-		mimeType = "text/markdown"
-	}
-	filename := target[strings.LastIndex(target, "/")+1:]
-	if filename == "" {
-		filename = "memory.md"
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 75*time.Second)
-	defer cancel()
-
-	ref, errUpload := h.uploadMemoryFile(ctx, rt, auth, filename, mimeType, body)
-	if errUpload != nil {
-		h.logf("memory DAV PUT 上传失败: %v", errUpload)
-		http.Error(w, errUpload.Error(), http.StatusBadGateway)
-		return
-	}
-
-	taskID, errImport := h.importMemoryTo(ctx, rt, auth, ref, target)
-	if errImport != nil {
-		h.logf("memory DAV PUT 导入失败: %v", errImport)
-		http.Error(w, errImport.Error(), http.StatusBadGateway)
-		return
-	}
-
-	// 上游是异步的，等到终态再回 201，客户端才不会读到半截。
-	status := h.waitMemoryTask(ctx, rt, auth, taskID)
-	h.logf("memory DAV PUT %s → 201（task=%s status=%s）", target, taskID, status)
-	w.WriteHeader(http.StatusCreated)
-}
-
-// uploadMemoryFile 走 multipart 传文件，回 fileRef。
-func (h *handler) uploadMemoryFile(ctx context.Context, rt route, auth, filename, mimeType string, data []byte) (map[string]string, error) {
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	hdr := make(textproto.MIMEHeader)
-	hdr.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`,
-		strings.ReplaceAll(filename, `"`, "")))
-	hdr.Set("Content-Type", mimeType)
-	part, errPart := mw.CreatePart(hdr)
-	if errPart != nil {
-		return nil, errPart
-	}
-	if _, errWrite := part.Write(data); errWrite != nil {
-		return nil, errWrite
-	}
-	if errClose := mw.Close(); errClose != nil {
-		return nil, errClose
-	}
-
-	req, errReq := h.memoryRequest(ctx, http.MethodPost, rt, "/v1/files", auth, mw.FormDataContentType(), &buf)
-	if errReq != nil {
-		return nil, errReq
-	}
-	resp, errDo := h.client.Do(req)
-	if errDo != nil {
-		return nil, errDo
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upload 失败 %d: %s", resp.StatusCode, truncateForLog(raw, 200))
-	}
-
-	var out struct {
-		File struct {
-			FileRef map[string]string `json:"fileRef"`
-		} `json:"file"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("decode upload: %w", err)
-	}
-	if out.File.FileRef == nil || out.File.FileRef["fileId"] == "" {
-		return nil, fmt.Errorf("upload 响应缺少 fileRef: %s", truncateForLog(raw, 200))
-	}
-	return out.File.FileRef, nil
-}
-
-// importMemoryTo 提交定点导入，回 task id。
-func (h *handler) importMemoryTo(ctx context.Context, rt route, auth string, ref map[string]string, target string) (string, error) {
-	payload, errMarshal := json.Marshal(map[string]any{"fileRef": ref, "path": target})
-	if errMarshal != nil {
-		return "", errMarshal
-	}
-	req, errReq := h.memoryRequest(ctx, http.MethodPost, rt, "/v1/memories/upload", auth,
-		"application/json", bytes.NewReader(payload))
-	if errReq != nil {
-		return "", errReq
-	}
-	resp, errDo := h.client.Do(req)
-	if errDo != nil {
-		return "", errDo
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("import 失败 %d: %s", resp.StatusCode, truncateForLog(raw, 200))
-	}
-	var out struct {
-		Task struct {
-			ID string `json:"id"`
-		} `json:"task"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", fmt.Errorf("decode import: %w", err)
-	}
-	if out.Task.ID == "" {
-		return "", fmt.Errorf("import 响应缺少 task: %s", truncateForLog(raw, 200))
-	}
-	return out.Task.ID, nil
-}
-
-// waitMemoryTask 轮询到终态，回最后一次看到的 status。
-// 超时不是错误：任务在服务端会继续跑，只是这一轮没等到。
-func (h *handler) waitMemoryTask(ctx context.Context, rt route, auth, taskID string) string {
-	status := "queued"
-	for {
-		select {
-		case <-ctx.Done():
-			return status
-		case <-time.After(1500 * time.Millisecond):
-		}
-		req, errReq := h.memoryRequest(ctx, http.MethodGet, rt, "/v1/tasks/"+taskID, auth, "", nil)
-		if errReq != nil {
-			return status
-		}
-		resp, errDo := h.client.Do(req)
-		if errDo != nil {
-			return status
-		}
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<18))
-		resp.Body.Close()
-		var out struct {
-			Task struct {
-				Status string `json:"status"`
-			} `json:"task"`
-		}
-		if json.Unmarshal(raw, &out) != nil {
-			return status
-		}
-		if out.Task.Status != "" {
-			status = out.Task.Status
-		}
-		switch status {
-		case "completed", "failed", "cancelled", "stopped", "error":
-			return status
-		}
-	}
-}
-
 // memoryRequest 组装一个打向上游 API 的请求（路由前缀 + 认证头）。
-func (h *handler) memoryRequest(ctx context.Context, method string, rt route, path, auth, contentType string, body io.Reader) (*http.Request, error) {
+func (h *handler) memoryRequest(rt route, method, path, auth, contentType string, body io.Reader) (*http.Request, error) {
 	target := strings.TrimRight(rt.Upstream, "/") + rt.Prefix + path
-	req, err := http.NewRequestWithContext(ctx, method, target, body)
+	req, err := http.NewRequest(method, target, body)
 	if err != nil {
 		return nil, err
 	}
@@ -508,7 +305,7 @@ func (h *handler) memoryRequest(ctx context.Context, method string, rt route, pa
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, text/markdown, */*")
 	req.Header.Set("Origin", rt.App)
 	req.Header.Set("X-App-Version", "1.24.0")
 	req.Header.Set("X-Client-Platform", "windows-client")

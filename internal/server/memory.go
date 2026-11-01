@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -32,6 +33,11 @@ func (s *Server) memoryRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/panel/accounts/{id}/memories/unpin", s.panelAuth(http.HandlerFunc(s.handleMemoryUnpin)))
 	mux.Handle("POST /api/panel/accounts/{id}/memories/import", s.panelAuth(http.HandlerFunc(s.handleMemoryImport)))
 	mux.Handle("GET /api/panel/accounts/{id}/memories/import/{taskId}", s.panelAuth(http.HandlerFunc(s.handleMemoryImportTask)))
+
+	// 精确写：DAV 的 GET/PUT/DELETE 在上游原生可用，内容不经 agent 改写。
+	mux.Handle("GET /api/panel/accounts/{id}/memories/file", s.panelAuth(http.HandlerFunc(s.handleMemoryFileGet)))
+	mux.Handle("PUT /api/panel/accounts/{id}/memories/file", s.panelAuth(http.HandlerFunc(s.handleMemoryFilePut)))
+	mux.Handle("DELETE /api/panel/accounts/{id}/memories/file", s.panelAuth(http.HandlerFunc(s.handleMemoryFileDelete)))
 }
 
 func (s *Server) handleMemories(w http.ResponseWriter, r *http.Request) {
@@ -239,6 +245,109 @@ func (s *Server) handleMemoryImportTask(w http.ResponseWriter, r *http.Request) 
 		"task":     task,
 		"terminal": isTerminalTaskStatus(task.Status),
 	})
+}
+
+// ---------- 精确读写（DAV 直通，不经 agent） ----------
+
+// memoryTargetFrom 从 ?path= 取路径并校验。
+func memoryTargetFrom(w http.ResponseWriter, r *http.Request) (string, bool) {
+	path := r.URL.Query().Get("path")
+	if !today.ValidMemoryPath(path) {
+		writeError(w, http.StatusBadRequest, "path 必须是 /memory/ 下的文件路径，例如 /memory/notes/a.md")
+		return "", false
+	}
+	return path, true
+}
+
+func (s *Server) handleMemoryFileGet(w http.ResponseWriter, r *http.Request) {
+	acct := s.accountOf(w, r.PathValue("id"))
+	if acct == nil {
+		return
+	}
+	path, ok := memoryTargetFrom(w, r)
+	if !ok {
+		return
+	}
+	cfg := s.store.Snapshot()
+	client := s.pool.ClientOf(*acct, cfg)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	content, err := client.ReadMemoryFile(ctx, path)
+	if err != nil {
+		s.pool.Report(acct.ID, err, "")
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"account": acct.ID,
+		"path":    path,
+		"content": content,
+		"bytes":   len(content),
+	})
+}
+
+func (s *Server) handleMemoryFilePut(w http.ResponseWriter, r *http.Request) {
+	acct := s.accountOf(w, r.PathValue("id"))
+	if acct == nil {
+		return
+	}
+	path, ok := memoryTargetFrom(w, r)
+	if !ok {
+		return
+	}
+	body, errRead := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if errRead != nil {
+		writeError(w, http.StatusBadRequest, "读取请求体失败: "+errRead.Error())
+		return
+	}
+	if len(body) == 0 {
+		writeError(w, http.StatusBadRequest, "内容不能为空；要删除请用 DELETE")
+		return
+	}
+
+	cfg := s.store.Snapshot()
+	client := s.pool.ClientOf(*acct, cfg)
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	if err := client.WriteMemoryFile(ctx, path, body); err != nil {
+		s.pool.Report(acct.ID, err, "")
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	// 写完立刻回读，把「真的存进去了」摆出来，而不是只回一个 201。
+	back, errBack := client.ReadMemoryFile(ctx, path)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"account":  acct.ID,
+		"path":     path,
+		"bytes":    len(body),
+		"verified": errBack == nil && back == string(body),
+		"note":     "直写 DAV PUT，内容不经 agent 改写",
+	})
+}
+
+func (s *Server) handleMemoryFileDelete(w http.ResponseWriter, r *http.Request) {
+	acct := s.accountOf(w, r.PathValue("id"))
+	if acct == nil {
+		return
+	}
+	path, ok := memoryTargetFrom(w, r)
+	if !ok {
+		return
+	}
+	cfg := s.store.Snapshot()
+	client := s.pool.ClientOf(*acct, cfg)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := client.DeleteMemoryFile(ctx, path); err != nil {
+		s.pool.Report(acct.ID, err, "")
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"account": acct.ID, "path": path, "deleted": true})
 }
 
 func isTerminalTaskStatus(s string) bool {

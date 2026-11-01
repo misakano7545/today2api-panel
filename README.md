@@ -161,45 +161,40 @@ POST /api/panel/checkin                 # 全账号批量签到（并发 4）
 
 ## 记忆
 
-记忆在桌面上是 **WebDAV**（`PROPFIND /memory`），而 `api.todayai.cn/memory`
-被上游 ALB 按源 IP 拦掉，`/api/cloud` 的 Next rewrite 又承载不了 DAV
-（无 body → 边缘 400，带 body → 72s 超时 504）。所以网关**不走 DAV**，
-改走官方的 REST 通道。
+记忆在桌面上是 **WebDAV**（`PROPFIND /memory`）。实测下来，`/memory` 只有
+**列目录**这一个方法在 `todayai.cn/api/cloud` 通道上坏掉，文件级读写都是通的：
 
-读：
+| 方法 | 结果 |
+|---|---|
+| `GET /memory/<path>` | 200，真实正文 |
+| `PUT /memory/<path>` | 201，新建与覆盖都行 |
+| `DELETE /memory/<path>` | 204 |
+| `PROPFIND`（任意层级） | 无 body → 边缘 400；带 body → 504 |
+| `MKCOL` / `PROPPATCH` | 404 / 504 |
+
+所以网关分两路：文件操作**原样转发**（内容一字节不改），列表用
+`/v1/memories/pins` 的数据拼 207。
 
 | 面板接口 | 上游 |
 |---|---|
-| `GET /api/panel/accounts/{id}/memories` | `/v1/memories/pins`（每个 pin 下最近三个文件的正文） |
-| `POST …/memories/pin` `{"path":"/memory/notes"}` | `/v1/memories/pins`（顺带校验目录是否存在） |
+| `GET /api/panel/accounts/{id}/memories` | `/v1/memories/pins` |
+| `GET …/memories/file?path=/memory/notes/a.md` | `GET /memory/…`（直通） |
+| `PUT …/memories/file?path=…` | `PUT /memory/…`（直通，写完自动回读校验） |
+| `DELETE …/memories/file?path=…` | `DELETE /memory/…`（直通） |
+| `POST …/memories/pin` `{"path":"/memory/notes"}` | `/v1/memories/pins`（顺带校验目录存在） |
 | `POST …/memories/unpin` | `DELETE /v1/memories/pins` |
+| `POST …/memories/import` `{"filename","content","wait_sec"}` | `POST /v1/files` → `POST /v1/memories/upload` → 轮询 `/v1/tasks/{id}` |
 
-写：
+两条写入路径语义不同，别混：
 
-| 面板接口 | 上游 |
-|---|---|
-| `POST …/memories/import` `{"filename","content","path","wait_sec"}` | `POST /v1/files`（multipart）→ `POST /v1/memories/upload` `{fileRef,path}` → 轮询 `/v1/tasks/{id}` |
+- **精确覆写**（`PUT …/memories/file`）：内容原样落盘，写完回读校验字节一致，
+  毫秒级返回。可以改某一行。代价是**不留历史**——覆盖就是覆盖。
+- **导入**（`…/memories/import`）：上游起后台任务，agent 抽取后自己决定落
+  哪个目录、怎么组织正文，11–21 秒完成，可能合并进已有文件，也可能给正文
+  加一段「来源」脚注。适合「记一条新的」，不能用来改某一行。
 
-`path` 是**定点写入**，必须是 `/memory/<...>` 绝对形态：
-
-- 目录不存在会自动建；
-- 同路径再写是**替换**，旧版本归档到 `history/<path>`（内容是 agent 转述的摘要，不是逐字节原文）；
-- 传了就一定落到该路径；不传则由上游 agent 自己挑目录。
-
-中继的 DAV 垫层也支持 `PUT /memory/<path>`，走的就是这条通道：
-传文件 → 定点导入 → 轮询到终态 → `201`。一次要 **11–21 秒**（等后台 agent），
-DAV 客户端要相应调大超时。`DELETE` / `MKCOL` / `MOVE` 没有对应通道，回 `501`。
-
-两者都是**异步**的：上游起后台任务，agent 抽取文件内容后写盘。差别在落点：
-
-- **不传 `path`**：agent 自己决定目录/文件名，可能合并进已有文件（版本号继续涨）；
-- **传 `path`**：落点由你定，同路径再写是替换，旧版本进 `history/`。
-
-两种情况正文都可能被 agent 追加一段「来源」脚注，也可能不加 —— 这是它的判断，
-客户端关不掉。所以不要假设「读回 == 写进」，用 `updatedAt` 或 activities 判定落地。
-
-同一个 `fileRef` 重复提交幂等（回同一 task id + `idempotent: true`），
-但带上不同的 `path` 会算成新请求（幂等键包含 path）。
+中继的 DAV 垫层：`GET`/`PUT`/`DELETE` 原样转发，`PROPFIND` 用 pins 拼 207，
+`MKCOL`/`MOVE`/`COPY`/`PROPPATCH` 回 501（上游确实没有）。
 
 任务详情在 `/v1/tasks/{id}`。**`/v2/tasks/{id}` 是 404 的空壳**。
 

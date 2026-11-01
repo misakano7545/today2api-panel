@@ -698,6 +698,77 @@ $("#memImportBtn").addEventListener("click", async () => {
   }
 });
 
+function renderMemoryEditResult(msg, ok) {
+  const el = $("#memEditResult");
+  el.innerHTML = `<div class="hint">${ok ? "✅ " : "⚠️ "}${esc(msg)}</div>`;
+}
+
+$("#memLoadBtn").addEventListener("click", async () => {
+  const id = state.memory.account;
+  if (!id) return toast("先选账号", "bad");
+  const path = ($("#memEditPath").value || "").trim();
+  if (!path) return toast("填文件路径，例如 /memory/notes/a.md", "bad");
+  try {
+    const out = await api(
+      `/api/panel/accounts/${encodeURIComponent(id)}/memories/file?path=${encodeURIComponent(path)}`,
+    );
+    $("#memEditContent").value = out.content || "";
+    renderMemoryEditResult(`已读取 ${out.bytes} 字节`, true);
+  } catch (err) {
+    renderMemoryEditResult(err.message, false);
+  }
+});
+
+$("#memSaveBtn").addEventListener("click", async () => {
+  const btn = $("#memSaveBtn");
+  const id = state.memory.account;
+  if (!id) return toast("先选账号", "bad");
+  const path = ($("#memEditPath").value || "").trim();
+  if (!path) return toast("填文件路径", "bad");
+  const content = $("#memEditContent").value;
+  if (!content) return toast("内容不能为空；要删除请用「删除」", "bad");
+  btn.disabled = true;
+  btn.textContent = "保存中…";
+  try {
+    const out = await api(
+      `/api/panel/accounts/${encodeURIComponent(id)}/memories/file?path=${encodeURIComponent(path)}`,
+      { method: "PUT", body: content, headers: { "Content-Type": "text/markdown; charset=utf-8" } },
+    );
+    renderMemoryEditResult(
+      `已写入 ${out.bytes} 字节，回读校验${out.verified ? "一致" : "不一致！"}`,
+      out.verified,
+    );
+    if (out.verified) {
+      toast("已保存", "ok");
+      await loadMemory();
+    }
+  } catch (err) {
+    renderMemoryEditResult(err.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "保存";
+  }
+});
+
+$("#memDeleteBtn").addEventListener("click", async () => {
+  const id = state.memory.account;
+  if (!id) return toast("先选账号", "bad");
+  const path = ($("#memEditPath").value || "").trim();
+  if (!path) return toast("填要删的文件路径", "bad");
+  if (!window.confirm(`确认删除 ${path}？`)) return;
+  try {
+    const out = await api(
+      `/api/panel/accounts/${encodeURIComponent(id)}/memories/file?path=${encodeURIComponent(path)}`,
+      { method: "DELETE" },
+    );
+    renderMemoryEditResult(`已删除 ${out.path}`, true);
+    $("#memEditContent").value = "";
+    await loadMemory();
+  } catch (err) {
+    renderMemoryEditResult(err.message, false);
+  }
+});
+
 /* ---------- 启动 ---------- */
 
 switchView((location.hash || "#overview").slice(1));

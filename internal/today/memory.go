@@ -261,6 +261,79 @@ func (c *Client) AboutUser(ctx context.Context) (string, error) {
 	return out.PlainContent, nil
 }
 
+// ReadMemoryFile 直接读一个记忆文件的正文。
+//
+// DAV 的文件级 GET 在 /api/cloud 通道上是通的（已实测 200 原文），
+// 只有 PROPFIND 列举坏了。所以按已知路径取文件不必绕 pins。
+func (c *Client) ReadMemoryFile(ctx context.Context, path string) (string, error) {
+	status, raw, err := c.doRaw(ctx, http.MethodGet, davPath(path), "", nil)
+	if err != nil {
+		return "", err
+	}
+	if status == http.StatusNotFound {
+		return "", &Error{Kind: KindServer, Status: status, Msg: "记忆文件不存在: " + path}
+	}
+	if status != http.StatusOK {
+		return "", classify("memory read", status, raw)
+	}
+	return string(raw), nil
+}
+
+// WriteMemoryFile 精确覆写一个记忆文件，内容一字节不改。
+//
+// 上游原生支持 PUT /memory/<path>（已实测 201，GET 回读与写入完全一致）。
+// 这条路径不经过任何 agent，所以不会像 /v1/memories/upload 那样被重写正文。
+// 目录不存在时上游会自动创建。
+func (c *Client) WriteMemoryFile(ctx context.Context, path string, data []byte) error {
+	contentType := "text/markdown"
+	if !strings.HasSuffix(strings.ToLower(path), ".md") {
+		contentType = "text/plain"
+	}
+	status, raw, err := c.doRaw(ctx, http.MethodPut, davPath(path), contentType, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	if status != http.StatusCreated && status != http.StatusOK && status != http.StatusNoContent {
+		return classify("memory write", status, raw)
+	}
+	return nil
+}
+
+// DeleteMemoryFile 删除一个记忆文件（上游 DELETE 实测 204）。
+func (c *Client) DeleteMemoryFile(ctx context.Context, path string) error {
+	status, raw, err := c.doRaw(ctx, http.MethodDelete, davPath(path), "", nil)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusNotFound {
+		return &Error{Kind: KindServer, Status: status, Msg: "记忆文件不存在: " + path}
+	}
+	if status != http.StatusNoContent && status != http.StatusOK {
+		return classify("memory delete", status, raw)
+	}
+	return nil
+}
+
+// davPath 把 /memory/a/b.md 变成上游能吃的 /memory/a/b.md（带前导斜杠、去重斜杠）。
+// 传给客户端之前统一校验前缀，避免拿任意路径去打上游。
+func davPath(p string) string {
+	p = strings.TrimSpace(p)
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	for strings.Contains(p, "//") {
+		p = strings.ReplaceAll(p, "//", "/")
+	}
+	return p
+}
+
+// ValidMemoryPath 校验是不是 /memory/ 下的合法文件路径。
+func ValidMemoryPath(p string) bool {
+	p = davPath(p)
+	return strings.HasPrefix(p, "/memory/") && len(p) > len("/memory/") &&
+		!strings.Contains(p, "..")
+}
+
 func jsonReader(v any) io.Reader {
 	buf, err := json.Marshal(v)
 	if err != nil {

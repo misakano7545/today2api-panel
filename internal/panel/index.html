@@ -235,6 +235,23 @@ code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:
 
       <div class="panel">
         <header>
+          <h2>精确覆写</h2>
+          <span class="hint">直写 DAV PUT，内容一字节不改；不经过 agent</span>
+        </header>
+        <div class="body">
+          <div class="row" style="margin-bottom:10px">
+            <input id="memEditPath" placeholder="/memory/notes/test-memory.md" style="flex:1">
+            <button class="ghost" id="memLoadBtn">读取</button>
+            <button class="primary" id="memSaveBtn">保存</button>
+            <button class="danger" id="memDeleteBtn">删除</button>
+          </div>
+          <textarea id="memEditContent" rows="10" placeholder="先「读取」，或用上面的列表里点一个文件路径"></textarea>
+          <div id="memEditResult" style="margin-top:10px"><div class="empty">未操作</div></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <header>
           <h2>写入记忆（导入）</h2>
           <span class="hint">上传文件 → /v1/memories/upload → 后台 agent 抽取后写盘</span>
         </header>
