@@ -32,6 +32,7 @@ func (s *Server) panelRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /api/panel/keys/{name}", s.panelAuth(http.HandlerFunc(s.handleKeyDelete)))
 	mux.Handle("POST /api/panel/probe", s.panelAuth(http.HandlerFunc(s.handleProbe)))
 	s.growthRoutes(mux)
+	s.memoryRoutes(mux)
 
 	mux.Handle("GET /", panel.Handler())
 }

@@ -169,12 +169,12 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	templates, _ := client.TaskTemplates(ctx)
 	recs, _ := client.TaskRecommendations(ctx)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"account":       acct.ID,
-		"label":         acct.Label,
-		"tasks":         tasks,
-		"summary":       summary,
-		"templates":     templates,
-		"recommended":   recs,
+		"account":     acct.ID,
+		"label":       acct.Label,
+		"tasks":       tasks,
+		"summary":     summary,
+		"templates":   templates,
+		"recommended": recs,
 	})
 }
 

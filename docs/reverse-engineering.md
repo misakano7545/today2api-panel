@@ -844,3 +844,121 @@ Set-Cookie __Secure-today.desktop_session     {HttpOnly; Secure; SameSite=Lax; M
 - 配置里 `accounts[].cookie` 允许只填裸 session 值，
   `Config.Normalize` 会补上 `__Secure-better-auth.session_token=` 前缀。
   之前这条归一化只在面板 API 上做，从文件加载不走，手写配置换票必 401。
+
+---
+
+## 11. 记忆写入：DAV 写不可达，但有一条官方的 REST 导入通道
+
+第 9 节确认了 `/memory` 的 WebDAV 读写在本机网络下都到不了上游
+（`api.todayai.cn/memory` 被 ALB 403，`/api/cloud` 的 Next rewrite 承载不了 DAV）。
+读靠 `/v1/memories/pins` 兜住了，写就得另找路。
+
+结论：**DAV 写这条路彻底作废，但 `/v1/memories/upload` 是官方写入口，
+而且完全走 `/api/cloud`，本机能通。**
+语义是「导入」，不是「覆写」——这是关键差别。
+
+### 11.1 端点清单（全部实测）
+
+```text
+POST   /v1/files              multipart/form-data  → 201 {file:{fileRef:{fileId,versionId}}}
+POST   /v1/memories/upload    {"fileRef":{...}}     → 202 {task:{id,status:"queued"}}
+GET    /v1/tasks/{taskId}                           → 200 {task:{status,completedAt,completionSummary}}
+GET    /v1/memories/pins                            → 200 {items:[{path,name,files:[{path,content,...}]}]}
+POST   /v1/memories/pins      {"path":"/memory/x"}  → 200 {pin:{...}}   顺带校验目录存在
+DELETE /v1/memories/pins      {"path":"/memory/x"}  → 200
+GET    /v1/memories/activities                      → 200 {activities:[{type,file:{path,version},snapshot:{content}}]}
+GET    /v1/memories/about-user                      → 200 {fullContent,plainContent,updatedAt}
+```
+
+### 11.2 字段是用报错反推出来的
+
+`{}` 一律只回 `{"error":"Invalid request"}`，没有字段名提示。逐个试：
+
+| 请求 | 结果 | 结论 |
+|---|---|---|
+| `POST pins {"path":"/memory/about-user"}` | `200` | 字段就是 `path` |
+| `POST pins {"directory":...}` | `400` | 不是 `directory` |
+| `POST upload {"fileId","versionId"}` 平铺 | `400` | 不是平铺 |
+| `POST upload {"fileRef":{...}}` | `404 Uploaded file not found` | **形状对**，文件不存在 |
+| `POST upload {"storagePath":"x"}` | `403 Storage path does not belong to user` | 路径型入参存在但要归属校验 |
+
+`/v1/<any>.json` 没有 OpenAPI 文档可拉：未带票是 `401`，带票是 `404`。
+`/v1/openapi.json` 是假的，别浪费时间。
+
+### 11.3 一次完整写入的时间线（真实账号）
+
+```text
+07:29:05  POST /v1/files          201  nd_469ee…  ver_09bf2…   (62 B markdown)
+07:29:05  POST /v1/memories/upload 202  task 01a19603-1130-…  status=queued
+07:29:06  task startedAt
+07:29:20  activities: created  notes/test-memory.md  version 1
+07:29:23  task completedAt        → 约 17 秒
+```
+
+再导一次同样流程，`notes/test-memory.md` 变成 version 2、version 3：
+**agent 会合并进同一个文件并重写结构**，不是每次新建一个。
+
+### 11.4 语义：它叫导入，不叫编辑
+
+上游是一个后台任务，agent 抽取文件内容后自己决定：
+
+- 落到哪个目录（实测把无关的测试内容放进了自建的 `notes/`，
+  理由是「不属于身份/偏好/健康/工具习惯，不进 about-user/ preferences/ health/」）；
+- 用什么文件名（`note.md` → `notes/test-memory.md`）；
+- 正文怎么组织（加 frontmatter 记 source/saved/type，再分小节重述）。
+
+所以：
+
+- **能**「记一条新的」——把要记的内容写进文件传上去即可；
+- **不能**「把第 3 行改成 X」——没有按行改写的接口，
+  而且 agent 会重写整份文件，原样保留得不到保证；
+- 想要精确覆写，只能等 DAV 写恢复可达（即出口 IP 不再被 ALB 拦）。
+
+代码里 `internal/today/memory.go` 的注释、面板接口返回的 `note` 字段，
+都按这个语义写，避免用的人以为能改某一行。
+
+### 11.5 幂等性
+
+同一个 `fileRef` 重复提交返回**同一个 task id**，且第二次是
+`200`（不是 `202`）并带 `"idempotent": true`：
+
+```json
+{"task":{"id":"01a19603-1130-…","status":"queued","idempotent":true}}
+```
+
+所以重试是安全的；但**换一个文件再传同样的内容不是幂等的**，
+会再跑一次 agent 并叠加到同一份文件上（版本号继续涨）。
+
+### 11.6 `pins` 同时是「目录存在性探针」
+
+`POST /v1/memories/pins` 会先经 memory-service 校验路径。所以：
+
+- 返回 `200` + `pin` → 目录确实存在（哪怕它是 agent 刚建的）；
+- 返回 `400` → 路径不存在或格式不对。
+
+本机没法列 DAV 目录，这个副作用就成了唯一的「我到底写成功没有」的验证手段。
+面板的 `POST /api/panel/accounts/{id}/memories/pin` 就是干这个的。
+
+### 11.7 版本历史可以读
+
+`/v1/memories/activities` 每条带 `snapshot.content`（该版本的完整正文）：
+
+```json
+{"type":"updated","createdAt":"…07:42:50.905Z",
+ "file":{"path":"notes/test-memory.md","version":3},
+ "snapshot":{"version":3,"content":"---\nsource: 用户上传…"}}
+```
+
+所以「记得改过什么」是可查的，只是不能定向回滚。
+
+### 11.8 落到的代码
+
+| 位置 | 内容 |
+|---|---|
+| `internal/today/memory.go` | `UploadFile`（multipart）、`ImportMemory`、`MemoryImportTask`、`Pins`、`Pin`、`Unpin`、`AboutUser` |
+| `internal/today/client.go` | `doRaw`：任意 Content-Type 的原始 body 请求，401 换票重试，`do()` 只会 JSON |
+| `internal/server/memory.go` | 面板 API：列/钉/取消钉/导入（可 `wait_sec` 轮询到终态）/查任务 |
+
+任务详情走 `/v1/tasks/{id}`。**`/v2/tasks/{id}` 是 404 的空壳**，
+一开始按 `/v2` 写，表现是导入接口 3 秒就返回 `status:"queued"`、
+轮询那步静默失败——排查时注意这个坑。

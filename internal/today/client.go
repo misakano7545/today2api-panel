@@ -331,6 +331,56 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	return call()
 }
 
+// doRaw 发一个原始 body 的请求（multipart、自定义 Content-Type），
+// 401 时同样强制换票重试一次。do() 只会 JSON 序列化，上传走不了。
+func (c *Client) doRaw(ctx context.Context, method, path, contentType string, body io.Reader) (int, []byte, error) {
+	var payload []byte
+	if body != nil {
+		buf, errRead := io.ReadAll(body)
+		if errRead != nil {
+			return 0, nil, errRead
+		}
+		payload = buf
+	}
+
+	call := func() (int, []byte, error) {
+		token, errToken := c.Token(ctx)
+		if errToken != nil {
+			return 0, nil, errToken
+		}
+		var reader io.Reader
+		if payload != nil {
+			reader = bytes.NewReader(payload)
+		}
+		req, errReq := http.NewRequestWithContext(ctx, method, c.API+path, reader)
+		if errReq != nil {
+			return 0, nil, errReq
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Origin", c.App)
+		c.apiHeaders(req)
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		resp, errDo := c.HC.Do(req)
+		if errDo != nil {
+			return 0, nil, &Error{Kind: KindNetwork, Msg: errDo.Error()}
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		return resp.StatusCode, raw, nil
+	}
+
+	status, raw, err := call()
+	if err != nil || status != http.StatusUnauthorized {
+		return status, raw, err
+	}
+	c.mu.Lock()
+	c.jwt = ""
+	c.mu.Unlock()
+	return call()
+}
+
 // getJSON 发 GET 并把 2xx 的 body 解到 out。
 func (c *Client) getJSON(ctx context.Context, path string, query url.Values, what string, out any) error {
 	status, raw, err := c.do(ctx, http.MethodGet, path, query, nil)
