@@ -731,3 +731,116 @@ POST /v1/chat/completions (stream) → 200 SSE，delta 分块
 
 > 注意：命令行里直接塞中文会被 MSYS 按 GBK 传出去，上游存成乱码。
 > 测中文请用 UTF-8 文件 + `--data-binary @file`。这不是网关的问题。
+
+## 9. 记忆页：WebDAV，且现网下结构性不可达
+
+### 9.1 现象
+
+国内版客户端登录正常，但「记忆」页一直加载不出来。在中继日志里能看到：
+
+```
+OPTIONS  api.todayai.cn/memory   → 204
+PROPFIND api.todayai.cn/memory   → 400 (11B "Bad Request")
+GET      api.todayai.cn/v1/memories/overview → 200 (555B)
+```
+
+抓客户端原始请求（`-dump-request`）得到真实报文：
+
+```
+PROPFIND /memory
+Depth: infinity
+Accept: application/xml
+Content-Type: application/json
+（无 body）
+Origin: http://today-desktop.localhost
+X-Device-Id: web_81984182-…
+```
+
+渲染层用 `fetch` + `DOMParser` 解 `207 Multi-Status`。
+所以这是 **WebDAV**，不是普通 JSON 接口。
+
+### 9.2 为什么 400
+
+`api.todayai.cn` 被 ALB 拦，唯一可用通道是 `todayai.cn/api/cloud`（Next 服务端 rewrite）。
+但这条通道承载不了 PROPFIND，实测三种组合全废：
+
+| 发法 | 结果 |
+|---|---|
+| PROPFIND 无 body | 边缘 400 `Bad Request`（11B，Tengine） |
+| PROPFIND + `Content-Length: 0` | Next 自己的 400 HTML |
+| PROPFIND + body | 转发后挂到 72s，504 网关超时 |
+
+而 `PROPFIND /api/cloud/v1/memories/overview` 却返回 200 ——
+说明 PROPFIND 这个**方法**没被拦，是 `/memory` 这条 **DAV 路由**在 rewrite 后面不存在。
+（对照：`GET /api/cloud/memory` 不带票 401、带票 400，`/zzz` 是 404 —— 400 不等于 404，路由存在但拒绝该请求形态。）
+
+结论：**WebDAV 在现网下走不通**，页面必然抛 `Failed to fetch memories`。
+
+### 9.3 中继怎么绕：用 pins 拼 207
+
+`/v1/memories/pins` 是普通 JSON，正常 200，里面直接带着真实路径：
+
+```json
+{"items":[{"path":"/memory/about-user","name":"about-user","pinnedAt":"…"}]}
+```
+
+于是 `cmd/relay/memory.go` 做一个**只读垫层**：
+
+- `PROPFIND /memory` → 用 pins 拼 `207`：根 + 每个 pin 目录 + 目录下每个文件，
+  带 `displayname` / `collection` / `getcontenttype` / `getlastmodified`
+- `GET /memory/<path>` → 按路径取真实 `content` 和它的 `contentType`
+- `PUT` / `MKCOL` / `MOVE` / `DELETE` → `501`，且列表里不下发
+  `canDelete` / `canRename`，客户端会把删改入口收起来，而不是点了再失败
+
+两个必须注意的点：
+
+1. **CORS**。渲染层 `Origin: http://today-desktop.localhost` 打 `api.todayai.cn` 是跨域，
+   垫层自己回包就得自己给 `Access-Control-Allow-*`；带凭证不能回 `*`，要回显 Origin。
+2. **预检不带 Authorization**。`OPTIONS` 必须在鉴权之前放行，否则预检 401，
+   浏览器直接掐掉后面的 PROPFIND。
+
+### 9.4 边界
+
+这是**只读**垫层：能看到、能读，不能增删改。要写，得等 `/memory` 的 DAV 真身可达
+（`api.todayai.cn` 不再按源 IP 拦），或者逆向出 `/v1/memories/upload` 的写协议补上。
+
+## 10. 会话续期：JWT 可无限换，Cookie 有效期 60 天
+
+### 10.1 客户端代码里的定性结论
+
+`dist/app/app/index.js` → `AccountSessionTokenClient`：
+
+```js
+async refresh(token) {
+  const jwt = await this.issue(fetch, token.refreshCredential);   // GET /api/auth/token + Bearer
+  return { …token, refreshCredential: token.refreshCredential };  // ← 原样带回，永不轮换
+}
+async establish(fetcher, credential) {
+  return { …, refreshCredential: credential };                    // credential = 登录时的 session token
+}
+```
+
+也就是说：**JWT（1 小时）是消耗品，session token 才是长期凭证**，
+每次续期都用同一个值重换，不轮换、不失效。
+
+### 10.2 实测有效期
+
+中继把 `Set-Cookie` 的属性打进日志（只打名和有效期，不打值），登录时看到：
+
+```
+Set-Cookie __Secure-better-auth.session_token {Max-Age=5184000; HttpOnly; Secure; SameSite=Lax}
+Set-Cookie __Secure-today.desktop_session     {HttpOnly; Secure; SameSite=Lax; Max-Age=0}
+```
+
+`5184000s` = **60 天**。只要在有效期内用一次，就能换出新的 JWT。
+
+### 10.3 落到网关
+
+- 网关存 **Cookie（签名形态 `raw.sig`）**，不存 JWT；
+  `internal/today/client.go` 的 `Token()` 提前 60s 续期，调用方无感。
+- **raw token 单独当 Cookie 是无效的**（服务端要签名形态），会 401。
+  所以中继登录时把 `Set-Cookie` 的签名值按 raw token 建索引，并落盘（0600），
+  重启后仍能换票 —— 否则客户端下一次换票必然 401。
+- 配置里 `accounts[].cookie` 允许只填裸 session 值，
+  `Config.Normalize` 会补上 `__Secure-better-auth.session_token=` 前缀。
+  之前这条归一化只在面板 API 上做，从文件加载不走，手写配置换票必 401。

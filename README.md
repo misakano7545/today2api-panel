@@ -24,6 +24,9 @@ go build -o today2api ./cmd/server
 
 拿 Cookie：浏览器登录 [todayai.cn](https://todayai.cn) → F12 → Application → Cookies → 复制 `__Secure-better-auth.session_token` 的值（或整段 Cookie 头）。网关会立刻用它换一次 JWT 验证，失败不会写库。
 
+这个 Cookie 的有效期是 **60 天**（`Set-Cookie` 的 `Max-Age=5184000`），而 JWT 只有 1 小时。
+网关只存 Cookie，每次调用提前 60 秒自动换新 JWT —— 粘一次就够。
+
 国内版的邮箱登录是关闭的（上游返回 `auth.email_sign_in_disabled`），所以面板只收 Cookie。
 如果只想临时验证，也可以在「凭证类型」里选 API JWT 直接粘贴——那种票只有 1 小时寿命。
 
@@ -52,6 +55,44 @@ export ANTHROPIC_API_KEY=sk-today-…
 | `GET /healthz` | 存活探针 | — |
 
 没配密钥时不校验鉴权（仅建议本机/内网用）；配了密钥后 `Authorization: Bearer …` 与 `x-api-key` 都认。
+
+## 本机中继（`cmd/relay`）——只在「桌面客户端用不了」时需要
+
+如果你的出口 IP 没被拦，跳过这一节：网关只用 Cookie，直连 `todayai.cn/api/cloud`。
+
+被拦的症状是桌面客户端一直「账号服务不可用」，而浏览器网页登录正常 ——
+因为 `api.todayai.cn` / `auth.todayai.cn` 前置的 ALB 按源 IP 回 `403 text/html`，
+网页走的是同源 rewrite，不经过那道墙。
+
+```bash
+go build -o relay.exe ./cmd/relay
+./relay.exe -listen 127.0.0.1:443 -dir ./relay-cert -v \
+  -cookie-file ./relay-cookies.json
+```
+
+首次运行会在 `-dir` 下生成自签 CA 与叶子证书（覆盖 `api.` / `auth.todayai.cn`）。
+然后：
+
+1. 把这两个域名写进 `hosts` 指到 `127.0.0.1`；
+2. 把 `ca.pem` 装进**当前用户**根证书库（`certutil -addstore -user Root`）；
+3. 给客户端进程设 `NODE_EXTRA_CA_CERTS=<ca.pem 路径>`。
+
+除了转发，中继还补了三件上游本来由 ALB 后面的服务提供的东西：
+
+| 能力 | 原因 |
+|---|---|
+| 换票合成 | 桌面端 `GET /api/auth/token` + Bearer，前端站点这条路径是 OAuth2（GET 回 405）；中继翻成 `POST {app}/api/token` + Cookie |
+| WS 垫层 | 真 WS 在 ALB 后面，Vercel 建不了 Upgrade；中继自己 101 + pong，止住客户端重连风暴 |
+| `/memory` 只读 DAV | 记忆页是 `PROPFIND /memory`，Next 的 rewrite 承载不了（无 body 400 / 带 body 504）；中继用 `/v1/memories/pins` 的真实数据拼 207，只读，不能增删改 |
+
+`-cookie-file` 一定要给：签名 Cookie 落盘（0600），中继重启后仍能换票；
+不给的话重启一次，客户端下一次换票就 401、直接掉登录态。
+
+回滚 = 删 hosts 那段 + `certutil -delstore -user Root "<CA 名>"` + 清掉
+`NODE_EXTRA_CA_CERTS`，删掉中继进程即可。客户端本身一个字节都没改。
+
+细节与实测证据见 [`docs/network-reachability.md`](docs/network-reachability.md)、
+[`docs/reverse-engineering.md`](docs/reverse-engineering.md) 第 9、10 节。
 
 ## 上游协议（为什么网关要翻译）
 

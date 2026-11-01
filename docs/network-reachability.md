@@ -113,12 +113,36 @@ prod: {
 **已完整还原**：`app.asar.orig` 改回 `app.asar`，`resources/app/` 目录删除，
 客户端恢复正常启动。不要重复这个改法。
 
-### 还剩的可行改法（都需要动系统，需单独确认）
+### 最终采用的改法：本地 TLS 中继（已实现，`cmd/relay`）
 
-1. **hosts + 本地 TLS 中继**：`api.today.ai` → `127.0.0.1`，本地起 TLS 服务
-   转发到 `today.ai/api/cloud`。要生成自签 CA 并装进 Windows 根证书库
-   （客户端用 undici，不装 CA 会证书错误）。改动面：hosts + 根证书 + 常驻进程。
-2. **换出口**：手机热点 / 代理，让 ALB 看不到这个源 IP。最省事，五分钟能验。
+`api.todayai.cn` / `auth.todayai.cn` → `127.0.0.1`（hosts），本地起 TLS 服务，
+按 SNI 把 API 请求补上 `/api/cloud` 前缀转发到前端站点，Auth 请求原样转发；
+自签 CA 装进当前用户根证书库，客户端用 undici 也就认了。
+
+改的只有 hosts + 一个用户级根证书 + 一个常驻进程，全部可回滚
+（`rollback.cmd` 删 hosts 段、删根证书、清 `NODE_EXTRA_CA_CERTS`）。
+
+中继额外做了三件事，都是实测逼出来的：
+
+- **换票合成**：桌面端调 `GET {auth}/api/auth/token` + Bearer，前端站点那条路径是
+  OAuth2 端点（GET 回 405）。中继把 Bearer 翻成会话 Cookie 去打 `POST {app}/api/token`，
+  响应原样回传；
+- **WS 垫层**：真 WS 在 ALB 后面，Vercel 又建不了 Upgrade。中继自己完成 101 握手并回 pong，
+  客户端的重连循环停下来；业务数据本来就都走 HTTP；
+- **`/memory` 只读 DAV 垫层**：见 `docs/reverse-engineering.md` 第 9 节。
+
+### 出口 IP 的补充事实
+
+同一套 hosts + 中继，把 `api.*` / `auth.*` 指回来之后，客户端登录链路是完整的：
+
+```
+phone-number/verify 200 → /api/auth/token 200 → users/me 200
+  → registry/devices 201 → ws 101
+```
+
+也就是说 ALB 拦的只是**源 IP**，不是账号、不是客户端。
+换网络（手机热点）也能直接通，不需要中继。
+
 
 ## 5. 网关怎么绕（已实现并验证）
 
@@ -126,18 +150,10 @@ prod: {
 
 ```json
 "upstream": {
-  "cn": {
-    "app": "https://todayai.cn",
-    "auth": "https://todayai.cn",
-    "api": "https://todayai.cn/api/cloud",
-    "audience": "https://api.todayai.cn"
-  },
-  "global": {
-    "app": "https://today.ai",
-    "auth": "https://today.ai",
-    "api": "https://today.ai/api/cloud",
-    "audience": "https://api.today.ai"
-  }
+  "app": "https://todayai.cn",
+  "auth": "https://todayai.cn",
+  "api": "https://todayai.cn/api/cloud",
+  "audience": "https://api.todayai.cn"
 }
 ```
 
@@ -166,8 +182,9 @@ $ curl -X POST http://127.0.0.1:8692/api/panel/accounts/acc_cn/check
 1. 浏览器打开 `https://todayai.cn/login`，手机号 + 验证码登录；
 2. F12 → Application → Cookies → `https://todayai.cn`
    复制 `__Secure-better-auth.session_token` 的值（或整段 Cookie 头）；
-3. 粘到网关面板「账号」页，区域选「国内」；
+3. 粘到网关面板「账号」页；
 4. 网关用它换 JWT → 走 `todayai.cn/api/cloud` → 全功能可用。
 
-国际版同理，登录 `https://today.ai`（邮箱验证码，`today.ai/api/auth/*`
-实测 `200 {"success":true}`），把 Cookie 填成「国际」账号。
+只需要一次粘贴：`__Secure-better-auth.session_token` 的有效期是 **60 天**
+（登录时 `Set-Cookie` 的 `Max-Age=5184000`），而 JWT 只有 1 小时 ——
+网关存 Cookie，每次提前 60 秒自动换新 JWT，你不用管。
